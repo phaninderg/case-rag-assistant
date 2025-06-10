@@ -41,41 +41,26 @@ class EmbeddingService:
             add_start_index=True,
         )
     
-    def _prepare_documents(self, text: str, metadata: Dict[str, Any]) -> List[Document]:
-        """Split text into chunks and create document objects."""
-        # Split text into chunks
-        texts = self.text_splitter.split_text(text)
-        
-        # Create document objects with metadata
-        documents = []
-        for i, text_chunk in enumerate(texts):
-            doc_metadata = metadata.copy()
-            doc_meta = {
-                "chunk": i,
-                "chunk_size": len(text_chunk),
-                **doc_metadata
-            }
-            documents.append(Document(
-                page_content=text_chunk,
-                metadata=doc_meta
-            ))
-        
-        return documents
-    
-    def add_document(self, case_id: str, text: str, metadata: Dict[str, Any]):
+    def add_document(self, case_number: str, text: str, metadata: Dict[str, Any]):
         """
         Add a document to the vector store.
         
         Args:
-            case_id: Unique identifier for the case
+            case_number: The case number (used as the primary identifier)
             text: Text content to embed
             metadata: Additional metadata for the document
         """
+        if not case_number:
+            raise ValueError("Case number is required")
+            
         # Prepare documents with proper chunking
-        docs = self._prepare_documents(text, {
-            "case_id": case_id,
-            **metadata
-        })
+        docs = self._prepare_documents(
+            text, 
+            {
+                "case_number": case_number,
+                **metadata
+            }
+        )
         
         # Add to vector store
         self.vector_store.add_documents(docs)
@@ -126,28 +111,28 @@ class EmbeddingService:
             
         results = collection.get()
         
-        # Group chunks by case_id
+        # Group chunks by case_number
         cases = {}
         for i, (doc_id, doc_text, metadata) in enumerate(zip(
             results["ids"],
             results["documents"],
             results["metadatas"]
         )):
-            case_id = metadata.get("case_id")
-            if not case_id:
+            case_number = metadata.get("case_number")
+            if not case_number:
                 continue
                 
-            if case_id not in cases:
-                cases[case_id] = {
-                    "case_id": case_id,
-                    "title": metadata.get("title", "Untitled"),
+            if case_number not in cases:
+                cases[case_number] = {
+                    "case_number": case_number,
+                    "subject": metadata.get("subject", ""),
                     "created_at": metadata.get("created_at"),
                     "chunks": [],
                     "metadata": {k: v for k, v in metadata.items() 
-                                 if k not in ["chunk", "chunk_size"]}
+                                 if k not in ["chunk", "chunk_size", "case_number"]}
                 }
             
-            cases[case_id]["chunks"].append({
+            cases[case_number]["chunks"].append({
                 "chunk_id": metadata.get("chunk", i),
                 "text": doc_text,
                 "length": len(doc_text)
@@ -158,3 +143,33 @@ class EmbeddingService:
             case["chunks"].sort(key=lambda x: x["chunk_id"])
         
         return list(cases.values())
+    
+    def _prepare_documents(self, text: str, metadata: Dict[str, Any]) -> List[Document]:
+        """
+        Split text into chunks and create document objects.
+        
+        Args:
+            text: The text to split into chunks
+            metadata: Metadata to include with each chunk
+            
+        Returns:
+            List of Document objects
+        """
+        # Split text into chunks
+        texts = self.text_splitter.split_text(text)
+        
+        # Create document objects with metadata
+        documents = []
+        for i, text_chunk in enumerate(texts):
+            doc_metadata = metadata.copy()
+            doc_meta = {
+                "chunk": i,
+                "chunk_size": len(text_chunk),
+                **doc_metadata
+            }
+            documents.append(Document(
+                page_content=text_chunk,
+                metadata=doc_meta
+            ))
+        
+        return documents

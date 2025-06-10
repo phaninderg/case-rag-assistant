@@ -20,6 +20,9 @@ python-magic==0.4.27
 # Web crawling and processing
 beautifulsoup4==4.12.2
 requests==2.31.0
+selenium==4.15.2
+undetected-chromedriver==3.5.4
+webdriver-manager==4.0.1
 newspaper3k==0.2.8  # Keep this first as it's more flexible with lxml
 trafilatura==1.6.2  # This requires lxml 4.9.2 on macOS
 lxml==4.9.2  # Specific version for trafilatura compatibility

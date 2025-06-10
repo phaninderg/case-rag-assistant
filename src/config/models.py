@@ -64,11 +64,22 @@ DEFAULT_LLM_MODELS = {
         provider=ModelProvider.HUGGINGFACE,
         model_id="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         context_length=2048,
+        max_new_tokens=512,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=50,
+        repetition_penalty=1.1,
         model_kwargs={
             "device_map": "auto",
-            "load_in_4bit": True,  # Enable 4-bit quantization
             "torch_dtype": "auto",
-            "trust_remote_code": True
+            "trust_remote_code": True,
+            "low_cpu_mem_usage": True,
+            "quantization_config": {
+                "load_in_4bit": True,
+                "bnb_4bit_quant_type": "nf4",
+                "bnb_4bit_compute_dtype": "float16",
+                "bnb_4bit_use_double_quant": True
+            }
         }
     ),
     "mistral-7b": LLMConfig(
@@ -76,9 +87,13 @@ DEFAULT_LLM_MODELS = {
         provider=ModelProvider.HUGGINGFACE,
         model_id="mistralai/Mistral-7B-v0.1",
         context_length=8192,
+        max_new_tokens=1024,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=50,
+        repetition_penalty=1.1,
         model_kwargs={
             "device_map": "auto",
-            "load_in_4bit": True,  # Enable 4-bit quantization
             "torch_dtype": "auto",
             "trust_remote_code": True,
             "low_cpu_mem_usage": True

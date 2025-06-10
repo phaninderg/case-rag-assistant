@@ -93,16 +93,20 @@ The API will be available at `http://localhost:8000`
 
 ## 🧩 API Endpoints
 
-### Cases
+### Case Management
 - `GET /api/cases` - List all cases with pagination
-- `GET /api/cases/{case_id}` - Get case details
 - `POST /api/cases` - Create a new case
-- `POST /api/cases/search` - Search for similar cases
-- `POST /api/cases/{case_id}/summarize` - Generate case summary
+- `GET /api/cases/{case_number}` - Get case details
+- `GET /api/case-numbers` - List all case numbers with basic info
+- `POST /api/cases/search` - Search for cases
+- `POST /api/cases/{case_number}/summarize` - Generate case summary
 
-### Models
+### LLM Configuration
 - `GET /api/models` - List available models
 - `POST /api/llm/config` - Update LLM configuration
+
+### Health Check
+- `GET /health` - Health check endpoint
 
 ## 🏗️ Project Structure
 
