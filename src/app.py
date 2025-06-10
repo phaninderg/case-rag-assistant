@@ -149,24 +149,22 @@ async def search_cases(search_request: CaseSearchRequest):
             detail=f"Search failed: {str(e)}"
         )
 
-@app.post("/api/cases/{case_number}/summarize")
+@app.post("/api/cases/{case_number}/summarize", response_model=str)
 async def summarize_case(
     case_number: str,
     request: Optional[CaseSummaryRequest] = None
 ):
-    """Generate a summary of a case using the LLM."""
+    """Generate a summary of a case using the LLM.
+    
+    Returns:
+        str: The generated summary as plain text
+    """
     try:
         if request is None:
             request = CaseSummaryRequest()
             
         summary = await case_service.generate_case_summary(case_number)
-        result = {"summary": summary}
-        
-        if request.include_similar:
-            similar_cases = case_service.get_related_cases(case_number, k=request.similar_k)
-            result["similar_cases"] = similar_cases
-            
-        return result
+        return summary
         
     except ValueError as e:
         raise HTTPException(
