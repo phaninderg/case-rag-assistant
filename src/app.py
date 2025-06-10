@@ -60,9 +60,10 @@ class CaseResponse(CaseCreate):
 class CaseSearchRequest(BaseModel):
     query: str
     k: int = Field(5, ge=1, le=20)
+    include_details: bool = False
 
 class CaseSearchResponse(BaseModel):
-    results: List[Dict[str, Any]]
+    results: Union[List[Dict[str, Any]], str]
     metadata: Dict[str, Any]
 
 class CaseSummaryRequest(BaseModel):
@@ -117,16 +118,28 @@ async def get_case(case_number: str):
 async def search_cases(search_request: CaseSearchRequest):
     """Search for cases similar to the query."""
     try:
-        results = await case_service.search_cases(
+        response = await case_service.search_cases(
             query=search_request.query,
-            k=search_request.k
+            k=search_request.k,
+            include_details=search_request.include_details
         )
         
+        # If include_details is True, the response is already a string from the LLM
+        if search_request.include_details:
+            return {
+                "results": response,
+                "metadata": {
+                    "query": search_request.query,
+                    "result_count": 1 if response != "I couldn't find any relevant cases matching your query." else 0
+                }
+            }
+        
+        # Otherwise, it's a list of results
         return {
-            "results": results,
+            "results": response,
             "metadata": {
                 "query": search_request.query,
-                "result_count": len(results)
+                "result_count": len(response)
             }
         }
     except Exception as e:

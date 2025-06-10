@@ -39,6 +39,26 @@ class CaseService:
         if 'close_notes' in case_data and case_data['close_notes']:
             close_notes = case_data['close_notes'].replace('\n', ' ').replace('\r', ' ').strip()
         
+        # Store the full description in metadata for reliable retrieval
+        metadata = {
+            "case_number": case_data["case_number"],
+            "subject": case_data.get("subject", ""),
+            "description": description,  # Store full description in metadata
+            "created_at": case_data.get("created_at") or datetime.utcnow().isoformat(),
+            "updated_at": case_data.get("updated_at") or datetime.utcnow().isoformat(),
+            "tags": json.dumps(case_data.get("tags", [])),
+            "description_length": len(description),
+        }
+        
+        # Add close_notes to metadata if it exists
+        if close_notes:
+            metadata["close_notes"] = close_notes
+        
+        # Only add parent_case if it exists and is a non-empty string
+        parent_case = case_data.get("parent_case")
+        if parent_case and isinstance(parent_case, str) and parent_case.strip():
+            metadata["parent_case"] = parent_case.strip()
+        
         # Create searchable text from all relevant fields
         search_text = (
             f"SUBJECT: {case_data.get('subject', '')}\n"
@@ -50,25 +70,6 @@ class CaseService:
         # Add close notes if they exist
         if close_notes:
             search_text += f"\nCLOSE_NOTES: {close_notes}"
-        
-        # Create metadata with only non-None values
-        metadata = {
-            "case_number": case_data["case_number"],
-            "subject": case_data.get("subject", ""),
-            "created_at": case_data.get("created_at") or datetime.utcnow().isoformat(),
-            "updated_at": case_data.get("updated_at") or datetime.utcnow().isoformat(),
-            "tags": json.dumps(case_data.get("tags", [])),
-            "description_length": len(description),
-        }
-        
-        # Add optional fields if they exist and are not None
-        if close_notes:
-            metadata["close_notes"] = close_notes
-        
-        # Only add parent_case if it exists and is a non-empty string
-        parent_case = case_data.get("parent_case")
-        if parent_case and isinstance(parent_case, str) and parent_case.strip():
-            metadata["parent_case"] = parent_case.strip()
         
         # Filter out None values from metadata
         metadata = {k: v for k, v in metadata.items() if v is not None}
@@ -164,46 +165,14 @@ class CaseService:
                 return None
                 
             doc = results[0]
-            
-            # Get all available data from metadata first
             metadata = doc.metadata
             
-            # Try to get description from metadata if available
+            # Get description directly from metadata where it's stored in full
             description = metadata.get("description", "")
-            
-            # If not in metadata, try to extract from page_content
-            if not description and doc.page_content:
-                if "DESCRIPTION:" in doc.page_content:
-                    # Extract content after DESCRIPTION: until the next section or end
-                    desc_parts = doc.page_content.split("DESCRIPTION:", 1)
-                    if len(desc_parts) > 1:
-                        remaining = desc_parts[1]
-                        # Look for the next section header (all caps followed by colon)
-                        import re
-                        match = re.search(r'\n[A-Z_]+:', remaining)
-                        if match:
-                            description = remaining[:match.start()].strip()
-                        else:
-                            description = remaining.strip()
-                else:
-                    # Fallback to the full page_content if we can't find the DESCRIPTION marker
-                    description = doc.page_content.strip()
-            
-            # Clean up the description
-            if description:
-                # Replace any remaining newlines with spaces
-                description = ' '.join(description.split())
-            
-            # Get subject from metadata first, fallback to extraction from page_content
-            subject = metadata.get("subject", "")
-            if not subject and "SUBJECT:" in doc.page_content:
-                subject_parts = doc.page_content.split("SUBJECT:", 1)
-                if len(subject_parts) > 1:
-                    subject = subject_parts[1].split("\n")[0].strip()
             
             return {
                 "case_number": metadata.get("case_number", ""),
-                "subject": subject,
+                "subject": metadata.get("subject", ""),
                 "description": description,
                 "parent_case": metadata.get("parent_case"),
                 "close_notes": metadata.get("close_notes"),
@@ -216,103 +185,146 @@ class CaseService:
             logger.error(f"Error retrieving case {case_number}: {str(e)}", exc_info=True)
             return None
 
-    async def search_cases(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+    async def search_cases(
+        self, 
+        query: str, 
+        k: int = 5, 
+        include_details: bool = False,
+        min_score: float = 0.7
+    ) -> Union[List[Dict[str, Any]], str]:
         """
-        Search for cases similar to the query using LLM.
+        Search for cases similar to the query using vector similarity search.
         
         Args:
             query: The search query
-            k: Maximum number of results to return (1-10)
+            k: Maximum number of results to return (1-20)
+            include_details: If True, returns a natural language response with case references
+            min_score: Minimum similarity score (0-1) for results to be included
             
         Returns:
-            List of dictionaries containing case_number, subject, and relevance_score
+            If include_details is False: List of case results with scores
+            If include_details is True: Natural language response with case references
             
         Raises:
-            ValueError: If LLM service is not available
+            ValueError: If LLM service is not available for include_details=True
         """
-        if not self.llm_service:
-            raise ValueError("LLM service is required for semantic search")
-        
-        # Get all cases first
-        all_cases = [self.get_case(case_number) for case_number in self.embedding_service.vector_store.get_all_ids()]
-        all_cases = [case for case in all_cases if case]
-        if not all_cases:
-            return []
+        try:
+            # First, try vector similarity search
+            vector_results = self.embedding_service.vector_store.similarity_search_with_score(
+                query,
+                k=min(k * 2, 20)  # Get more results to filter by score
+            )
             
-        # Format cases for the prompt
-        cases_info = []
-        for case in all_cases:
-            cases_info.append(f"Case Number: {case['case_number']} - Subject: {case['subject']}")
+            # Filter results by score and format
+            results = []
+            seen_cases = set()
+            
+            for doc, score in vector_results:
+                if score > min_score:
+                    continue
+                    
+                metadata = doc.metadata
+                case_number = metadata.get('case_number')
+                
+                # Skip if we've already seen this case (to avoid duplicates)
+                if case_number in seen_cases:
+                    continue
+                    
+                seen_cases.add(case_number)
+                
+                # Get full case details
+                case = self.get_case(case_number)
+                if case:
+                    results.append({
+                        **case,
+                        'relevance_score': 1.0 - score,  # Convert distance to similarity score
+                        'match_reason': f"Vector similarity: {1.0 - score:.2f}"
+                    })
+                
+                if len(results) >= k:
+                    break
+            
+            # If no results from vector search, try keyword search as fallback
+            if not results:
+                logger.warning(f"No vector search results for query: {query}")
+                
+                # Get all cases and do simple keyword matching
+                all_cases = self.embedding_service.get_all_cases()
+                for case in all_cases:
+                    metadata = case.get('metadata', {})
+                    case_number = metadata.get('case_number')
+                    
+                    if not case_number or case_number in seen_cases:
+                        continue
+                        
+                    seen_cases.add(case_number)
+                    case_details = self.get_case(case_number)
+                    
+                    if not case_details:
+                        continue
+                    
+                    # Simple keyword matching
+                    text_to_search = f"{case_details.get('subject', '')} {case_details.get('description', '')}".lower()
+                    query_terms = query.lower().split()
+                    
+                    # Count matching terms
+                    matches = sum(1 for term in query_terms if term in text_to_search)
+                    if matches > 0:
+                        results.append({
+                            **case_details,
+                            'relevance_score': min(0.7, matches * 0.1),  # Cap at 0.7 for keyword matches
+                            'match_reason': f"Keyword match: {matches} terms"
+                        })
+                    
+                    if len(results) >= k:
+                        break
+            
+            # Sort results by relevance score (highest first)
+            results.sort(key=lambda x: x.get('relevance_score', 0), reverse=True)
+            
+            # If include_details is True, generate a natural language response
+            if include_details and self.llm_service:
+                return await self._generate_search_response(query, results[:k])
+                
+            return results[:k]
+            
+        except Exception as e:
+            logger.error(f"Error in search_cases: {str(e)}", exc_info=True)
+            if include_details:
+                return f"An error occurred while searching: {str(e)}"
+            return []
+    
+    async def _generate_search_response(self, query: str, results: List[Dict[str, Any]]) -> str:
+        """Generate a concise natural language response for search results."""
+        if not results:
+            return "I couldn't find any relevant cases matching your query."
+            
+        # Get the most relevant case
+        most_relevant = results[0]
         
-        cases_text = "\n".join(cases_info)
-        
-        # Create prompt for the LLM
         prompt = f"""
-        You are a helpful assistant that finds relevant cases based on a search query.
+        You are a helpful support assistant. Provide a concise response (max 5 lines) 
+        to the user's query based on the following case information.
         
-        Here are the available cases:
-        {cases_text}
+        User Query: "{query}"
         
-        Search query: "{query}"
+        Most Relevant Case:
+        - Subject: {most_relevant.get('subject', 'No subject')}
+        - Description: {most_relevant.get('description', 'No description available')[:500]}
         
-        Please return the top {k} most relevant case numbers and their subjects.
-        For each case, provide:
-        1. A relevance score between 0.0 and 1.0 (1.0 being most relevant)
-        2. The case number
-        3. A very brief reason for the match (5-10 words)
-        
-        Format your response as a JSON array of objects with these fields:
-        - case_number: The case number
-        - subject: The case subject
-        - relevance_score: A float between 0.0 and 1.0
-        - match_reason: A very brief explanation of why this case matches
-        
-        Example:
-        [
-            {{
-                "case_number": "CASE-123",
-                "subject": "Server Outage",
-                "relevance_score": 0.95,
-                "match_reason": "Matches server downtime issue"
-            }}
-        ]
-        
-        Now, provide the top {k} most relevant cases for the query "{query}":
+        Provide a brief, helpful response that addresses the user's query using the case information.
+        Focus on the key points and keep it concise (max 5 lines).
         """
         
         try:
-            # Get response from LLM
             response = await self.llm_service.generate(prompt)
-            
-            # Parse the JSON response
-            try:
-                results = json.loads(response)
-                if not isinstance(results, list):
-                    results = [results]
-                    
-                # Ensure all required fields are present
-                valid_results = []
-                for result in results:
-                    if all(field in result for field in ["case_number", "subject", "relevance_score", "match_reason"]):
-                        valid_results.append({
-                            "case_number": str(result["case_number"]).strip(),
-                            "subject": str(result["subject"]).strip(),
-                            "relevance_score": float(result["relevance_score"]),
-                            "match_reason": str(result["match_reason"]).strip()
-                        })
-                
-                # Sort by relevance score (highest first)
-                valid_results.sort(key=lambda x: x["relevance_score"], reverse=True)
-                
-                return valid_results[:k]
-                
-            except (json.JSONDecodeError, ValueError, KeyError) as e:
-                logger.error(f"Error parsing LLM response: {str(e)}\nResponse: {response}")
-                raise ValueError("Failed to process search results. Please try again.")
-                
+            # Ensure the response is exactly 5 lines
+            lines = [line.strip() for line in response.strip().split('\n') if line.strip()]
+            return '\n'.join(lines[:5])
         except Exception as e:
-            logger.error(f"Error in semantic search: {str(e)}")
-            raise ValueError(f"Search failed: {str(e)}")
+            logger.error(f"Error generating search response: {str(e)}")
+            # Fall back to a simple response if LLM fails
+            return f"Based on case {most_relevant.get('case_number', 'N/A')}: {most_relevant.get('subject', 'No subject')}"
     
     async def get_related_cases(self, case_number: str, k: int = 3) -> List[Dict[str, Any]]:
         """
@@ -341,7 +353,7 @@ class CaseService:
         """
         
         # Use the search_cases method with the generated query
-        related_cases = await self.search_cases(search_query, k=k+1)  # +1 to account for self
+        related_cases = await self.search_cases(search_query, k=k+1, include_details=False)  # +1 to account for self
         
         # Filter out the reference case itself and limit to k results
         return [
