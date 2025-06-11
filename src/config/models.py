@@ -2,6 +2,7 @@ from enum import Enum
 from typing import Dict, Any, Optional, Union
 from pydantic import BaseModel, Field, validator
 from pathlib import Path
+import torch
 
 class ModelProvider(str, Enum):
     OPENAI = "openai"
@@ -63,38 +64,32 @@ DEFAULT_LLM_MODELS = {
         name="tinyllama",
         provider=ModelProvider.HUGGINGFACE,
         model_id="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        context_length=2048,
-        max_new_tokens=512,
-        temperature=0.7,
+        context_length=256,      # Much smaller context length
+        max_new_tokens=50,      # Keep responses short
+        temperature=0.2,        # Lower temperature for more focused responses
         top_p=0.9,
-        top_k=50,
+        top_k=40,
         repetition_penalty=1.1,
         model_kwargs={
             "device_map": "auto",
-            "torch_dtype": "auto",
+            "torch_dtype": torch.float32,  # Use float32 for CPU compatibility
             "trust_remote_code": True,
             "low_cpu_mem_usage": True,
-            "quantization_config": {
-                "load_in_4bit": True,
-                "bnb_4bit_quant_type": "nf4",
-                "bnb_4bit_compute_dtype": "float16",
-                "bnb_4bit_use_double_quant": True
-            }
         }
     ),
-    "mistral-7b": LLMConfig(
-        name="mistral-7b",
+    "distilgpt2": LLMConfig(
+        name="distilgpt2",
         provider=ModelProvider.HUGGINGFACE,
-        model_id="mistralai/Mistral-7B-v0.1",
-        context_length=8192,
-        max_new_tokens=1024,
-        temperature=0.7,
+        model_id="distilgpt2",
+        context_length=256,
+        max_new_tokens=50,
+        temperature=0.2,
         top_p=0.9,
-        top_k=50,
+        top_k=40,
         repetition_penalty=1.1,
         model_kwargs={
             "device_map": "auto",
-            "torch_dtype": "auto",
+            "torch_dtype": torch.float32,
             "trust_remote_code": True,
             "low_cpu_mem_usage": True
         }

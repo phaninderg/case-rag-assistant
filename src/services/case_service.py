@@ -363,32 +363,120 @@ class CaseService:
     
     async def generate_case_summary(self, case_number: str) -> str:
         """
-        Generate a summary of a case using LLM.
+        Generate a detailed and comprehensive summary of a case using LLM.
         
         Args:
             case_number: The case number to summarize
             
         Returns:
-            Generated summary text
+            Generated summary text (5-7 sentences)
             
         Raises:
             ValueError: If LLM service is not available or case not found
         """
         if not self.llm_service:
             raise ValueError("LLM service is required for summarization")
-            
+                
         case = self.get_case(case_number)
         if not case:
             raise ValueError(f"Case {case_number} not found")
-            
-        prompt = f"""
-        Please provide a concise summary of the following case:
         
-        Case Number: {case['case_number']}
-        Subject: {case['subject']}
-        Description: {case['description']}
+        # Get full subject and description without any trimming
+        subject = case.get('subject', 'No subject')
+        description = case.get('description', '')
         
-        Summary:
+        # Create a structured prompt with clear instructions
+        prompt = f"""You are a technical support analyst summarizing a support case. 
+        Generate a detailed 5-7 sentence summary following this exact structure:
+        
+        1. [First sentence: Clearly state the main issue or request]
+        2. [Second sentence: Describe the impact and urgency]
+        3. [Third sentence: Mention any troubleshooting steps already taken]
+        4. [Fourth sentence: Note any error messages or specific symptoms]
+        5. [Fifth sentence: Describe the current status]
+        6. [Sixth sentence: Mention any next steps or recommendations]
+        7. [Seventh sentence: Add any additional context if needed]
+        
+        CASE SUBJECT: {subject}
+        
+        FULL CASE DESCRIPTION:
+        {description}
+        
+        DETAILED SUMMARY (EXACTLY 5-7 SENTENCES):
         """
         
-        return await self.llm_service.generate(prompt)
+        try:
+            # Use parameters optimized for detailed, structured responses
+            response = await self.llm_service.generate(
+                prompt,
+                max_tokens=500,     # Increased for more detailed responses
+                temperature=0.5,    # Slightly higher for better creativity
+                top_p=0.95,
+                top_k=60,
+                do_sample=True,
+                num_return_sequences=1,
+                no_repeat_ngram_size=3,
+                early_stopping=True,
+                repetition_penalty=1.2,
+                length_penalty=1.3  # Strongly encourage longer responses
+            )
+            
+            if response and isinstance(response, str):
+                # Clean up the response
+                summary = response.strip()
+                
+                # Ensure we have multiple sentences
+                sentences = [s.strip() for s in summary.split('. ') if s.strip()]
+                if len(sentences) < 3:  # If we don't have enough sentences, try again with a different approach
+                    return await self._generate_alternative_summary(subject, description)
+                    
+                # Join sentences and ensure proper formatting
+                summary = '. '.join(sentences).strip()
+                if not summary.endswith('.'):
+                    summary += '.'
+                    
+                return summary
+                    
+        except Exception as e:
+            logger.error(f"Error generating case summary: {str(e)}")
+            
+        # Fallback to alternative generation method
+        return await self._generate_alternative_summary(subject, description)
+    
+    async def _generate_alternative_summary(self, subject: str, description: str) -> str:
+        """Alternative summary generation method if the primary one fails."""
+        try:
+            prompt = f"""Generate a detailed 5-7 sentence summary of this support case.
+            
+            Subject: {subject}
+            
+            Description: {description}
+            
+            Please provide a detailed summary with the following structure:
+            1. First sentence: What is the main issue?
+            2. Second sentence: What is the impact?
+            3. Third sentence: What has been tried?
+            4. Fourth sentence: What is the current status?
+            5. Fifth sentence: What are the next steps?
+            6. Sixth sentence: Any additional context?
+            7. Seventh sentence: Final thoughts or recommendations.
+            
+            Summary:"""
+            
+            response = await self.llm_service.generate(
+                prompt,
+                max_tokens=500,
+                temperature=0.6,
+                top_p=0.95,
+                top_k=60,
+                do_sample=True
+            )
+            
+            if response and isinstance(response, str):
+                return response.strip()
+                
+        except Exception as e:
+            logger.error(f"Error in alternative summary generation: {str(e)}")
+            
+        # Final fallback
+        return f"Case: {subject}"

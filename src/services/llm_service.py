@@ -5,6 +5,7 @@ from langchain.schema import HumanMessage, SystemMessage, AIMessage, BaseMessage
 from langchain.callbacks.manager import CallbackManager
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
 from huggingface_hub import login, HfApi
+import os
 
 from src.config.settings import settings
 from src.models.factory import ModelFactory
@@ -43,46 +44,28 @@ class LLMService:
     
     def _get_model_kwargs(self, llm_config):
         """Get model initialization kwargs with appropriate defaults."""
-        from transformers import BitsAndBytesConfig
-        
         model_kwargs = {}
         
         # Start with any model-specific kwargs from config
         if hasattr(llm_config, 'model_kwargs'):
             model_kwargs.update(llm_config.model_kwargs)
         
-        # Set device and dtype
-        if torch.cuda.is_available():
+        # Default to CPU for stability
+        device = "cpu"
+        torch_dtype = torch.float32
+        
+        # Only use CUDA if explicitly available and requested
+        if torch.cuda.is_available() and model_kwargs.get('device_map') != 'cpu':
             device = "cuda"
             torch_dtype = torch.float16
-        elif torch.backends.mps.is_available():
-            device = "mps"
-            torch_dtype = torch.float32
-        else:
-            device = "cpu"
-            torch_dtype = torch.float32
         
-        # Configure quantization if specified in model_kwargs
-        if 'quantization_config' in model_kwargs and isinstance(model_kwargs['quantization_config'], dict):
-            q_config = model_kwargs['quantization_config']
-            model_kwargs['quantization_config'] = BitsAndBytesConfig(
-                load_in_4bit=q_config.get('load_in_4bit', False),
-                load_in_8bit=q_config.get('load_in_8bit', False),
-                bnb_4bit_quant_type=q_config.get('bnb_4bit_quant_type', 'nf4'),
-                bnb_4bit_compute_dtype={
-                    'float16': torch.float16,
-                    'bfloat16': torch.bfloat16,
-                    'float32': torch.float32
-                }.get(q_config.get('bnb_4bit_compute_dtype', 'float16'), torch.float16),
-                bnb_4bit_use_double_quant=q_config.get('bnb_4bit_use_double_quant', True)
-            )
-        
-        # Update model kwargs with device and dtype
-        model_kwargs.update({
-            'device_map': model_kwargs.get('device_map', 'auto'),
-            'torch_dtype': model_kwargs.get('torch_dtype', torch_dtype),
-            'low_cpu_mem_usage': model_kwargs.get('low_cpu_mem_usage', True),
-        })
+        # Clean up model kwargs
+        model_kwargs = {
+            'device_map': device,
+            'torch_dtype': torch_dtype,
+            'low_cpu_mem_usage': True,
+            'trust_remote_code': model_kwargs.get('trust_remote_code', True),
+        }
         
         return model_kwargs
     
@@ -96,26 +79,21 @@ class LLMService:
             # Get model kwargs with appropriate defaults
             model_kwargs = self._get_model_kwargs(llm_config)
             
+            # Special handling for smaller models
+            if 'tinyllama' in self.model_name.lower() or 'distilgpt2' in self.model_name.lower():
+                model_kwargs['max_memory'] = {0: '2GB'}  # Limit memory usage
+                model_kwargs['device_map'] = 'auto'  # Let accelerate handle device placement
+            
             # Initialize the model
             return ModelFactory.create_llm(
                 llm_config,
-                streaming=self.streaming,
-                callback_manager=CallbackManager([StreamingStdOutCallbackHandler()]) if self.streaming else None,
                 model_kwargs=model_kwargs,
-                verbose=True,
-                max_sequence_length=2048,
-                batch_size=1,
-                use_fast=True,
+                streaming=self.streaming
             )
             
         except Exception as e:
             error_msg = f"Error initializing {self.model_name}: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            
-            if "gated" in str(e).lower() or "access" in str(e).lower():
-                model_id = getattr(llm_config, 'model_id', 'unknown')
-                logger.error(f"You may need to accept the model's terms at: https://huggingface.co/{model_id}")
-            
+            logger.error(error_msg)
             raise RuntimeError(f"Failed to initialize model. {error_msg}")
     
     def _truncate_text(self, text: str, max_tokens: int = 1000) -> str:
