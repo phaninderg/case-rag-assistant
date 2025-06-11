@@ -11,23 +11,32 @@ A powerful Retrieval-Augmented Generation (RAG) system for case task analysis, s
 - RESTful API with pagination and filtering
 - Asynchronous request handling
 - Configurable model parameters
+- Fine-tuning support for custom models
+- CPU-optimized training pipeline
 
 🔄 **Recent Updates**
-- Upgraded to latest dependency versions
-- Improved error handling and logging
-- Enhanced search functionality with similarity scoring
-- Added pagination and sorting for case listings
-- Integration with HuggingFace Hub for model management
+- Added fine-tuning capabilities for case-specific models
+- Improved tokenization and data preprocessing
+- Enhanced error handling and logging
+- CPU-optimized training pipeline for Apple Silicon
+- Support for custom case data formatting
+- Integration with HuggingFace Transformers for fine-tuning
 
 ## 🛠️ Features
 
-- **Multi-Model Support**: Choose from various LLM providers (OpenAI, HuggingFace, LLaMA) and embedding models
-- **Semantic Search**: Find similar cases using vector similarity search with configurable thresholds
-- **AI-Powered Analysis**: Generate intelligent case summaries and relevance analysis
-- **RESTful API**: Comprehensive API documentation with Swagger UI and ReDoc
+### Core Functionality
+- **Multi-Model Support**: Choose from various LLM providers (OpenAI, HuggingFace, LLaMA)
+- **Semantic Search**: Find similar cases using vector similarity search
+- **Case Management**: Store, retrieve, and manage case data with metadata
+- **Fine-Tuning**: Train custom models on your case data
+- **RESTful API**: Comprehensive API documentation with Swagger UI
+
+### Technical Features
+- **CPU Optimization**: Runs efficiently on CPU-only environments
 - **Asynchronous Processing**: Efficient handling of multiple concurrent requests
-- **Flexible Storage**: Local vector store with ChromaDB and file-based case storage
+- **Flexible Storage**: Local vector store with ChromaDB
 - **Environment Configuration**: Easy setup with environment variables
+- **Comprehensive Logging**: Detailed logging for debugging and monitoring
 
 ## 🚀 Getting Started
 
@@ -35,7 +44,7 @@ A powerful Retrieval-Augmented Generation (RAG) system for case task analysis, s
 
 - Python 3.9+
 - pip (Python package manager)
-- [Optional] NVIDIA GPU for local model acceleration
+- [Optional] For training: At least 8GB RAM recommended
 
 ### Installation
 
@@ -56,96 +65,74 @@ A powerful Retrieval-Augmented Generation (RAG) system for case task analysis, s
    pip install -r requirements.txt
    ```
 
-4. Create a `.env` file with your API keys (copy from `.env.example`):
+4. Set up environment variables:
    ```bash
-   # Required for OpenAI models
-   OPENAI_API_KEY=your-openai-key
-   
-   # Required for HuggingFace Hub models
-   HUGGINGFACE_API_KEY=your-hf-key
-   
-   # Model Defaults
-   DEFAULT_LLM=tinyllama  # or gpt-3.5-turbo, mistral-7b, etc.
-   DEFAULT_EMBEDDING=all-mpnet-base-v2
-   
-   # Server Configuration
-   HOST=0.0.0.0
-   PORT=8000
-   DEBUG=true
-   LOG_LEVEL=INFO
-   
-   # Data Directories
-   DATA_DIR=./data
+   cp .env.example .env
+   # Edit .env with your configuration
    ```
 
-## 🏃 Running the Application
+### Running the Application
 
-Start the FastAPI development server:
-```bash
-uvicorn src.app:app --reload
-```
+1. Start the FastAPI server:
+   ```bash
+   uvicorn src.app:app --reload
+   ```
 
-The API will be available at `http://localhost:8000`
+2. Access the API documentation:
+   - Swagger UI: http://localhost:8000/docs
+   - ReDoc: http://localhost:8000/redoc
 
-### API Documentation
-- Swagger UI: `http://localhost:8000/docs`
-- ReDoc: `http://localhost:8000/redoc`
+### Training a Custom Model
 
-## 🧩 API Endpoints
+1. Prepare your case data in JSON format (see `cases.json` for example)
 
-### Case Management
-- `GET /api/cases` - List all cases with pagination
-- `POST /api/cases` - Create a new case
-- `GET /api/cases/{case_number}` - Get case details
-- `GET /api/case-numbers` - List all case numbers with basic info
-- `POST /api/cases/search` - Search for cases
-- `POST /api/cases/{case_number}/summarize` - Generate case summary
+2. Start the training process:
+   ```bash
+   curl -X 'POST' \
+     'http://localhost:8000/train' \
+     -H 'accept: application/json' \
+     -F 'cases_file=@./path/to/your/cases.json'
+   ```
 
-### LLM Configuration
-- `GET /api/models` - List available models
-- `POST /api/llm/config` - Update LLM configuration
+3. Monitor training progress in the logs
 
-### Health Check
-- `GET /health` - Health check endpoint
-
-## 🏗️ Project Structure
+## 🧩 Project Structure
 
 ```
 case-rag-assistant/
 ├── src/
-│   ├── app.py                 # Main FastAPI application
-│   ├── config/                # Configuration settings
-│   │   ├── __init__.py
-│   │   ├── models.py         # Model configurations
-│   │   └── settings.py       # Application settings
-│   │
-│   ├── models/             # ML models and embeddings
-│   │   ├── __init__.py
-│   │   ├── embeddings.py     # Embedding service
-│   │   └── factory.py        # Model factory
-│   │
-│   ├── services/           # Business logic
-│   │   ├── __init__.py
-│   │   ├── case_service.py   # Case management
-│   │   ├── llm_service.py    # LLM interactions
-│   │   └── web_crawler.py    # Web crawling functionality
-│   │
-│   └── utils/              # Utility functions
-│       ├── __init__.py
-│       └── helpers.py        # Helper functions
-│
-├── data/                   # Case data storage (gitignored)
-│   ├── cases/              # Case JSON files
-│   └── embeddings/         # Vector database storage
-├── .env.example           # Example environment variables
-├── .gitignore
-├── README.md
-└── requirements.txt       # Python dependencies
+│   ├── config/         # Configuration files
+│   ├── models/         # Data models and embeddings
+│   ├── services/       # Core services
+│   │   ├── case_service.py    # Case management
+│   │   ├── llm_service.py     # LLM integration
+│   │   └── training_service.py # Model training
+│   ├── utils/          # Utility functions
+│   └── app.py          # FastAPI application
+├── tests/              # Test cases
+├── requirements.txt    # Python dependencies
+└── README.md          # This file
 ```
+
+## 📚 API Documentation
+
+### Endpoints
+
+- `GET /api/cases` - List all cases
+- `GET /api/cases/{case_id}` - Get case details
+- `POST /api/cases/search` - Search for similar cases
+- `POST /train` - Train a new model on case data
+- `GET /models` - List available models
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please follow these steps:
+
+1. Fork the repository
+2. Create a new branch for your feature
+3. Commit your changes
+4. Push to the branch
+5. Create a new Pull Request
 
 ## 📄 License
 
@@ -153,7 +140,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🙏 Acknowledgments
 
-- [LangChain](https://python.langchain.com/) for LLM orchestration
-- [Chroma](https://www.trychroma.com/) for vector storage
-- [FastAPI](https://fastapi.tiangolo.com/) for the web framework
-- [HuggingFace](https://huggingface.co/) for open-source models
+- [HuggingFace Transformers](https://huggingface.co/transformers/)
+- [LangChain](https://python.langchain.com/)
+- [FastAPI](https://fastapi.tiangolo.com/)
+- [ChromaDB](https://www.trychroma.com/)

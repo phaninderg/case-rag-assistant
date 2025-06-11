@@ -10,3 +10,4 @@ data/embeddings/
 debug/
 cases.json
 import.log
+trained_models/
