@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, status, Query, Body, Request
+from fastapi import FastAPI, HTTPException, status, Query, Body, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl
@@ -13,6 +13,7 @@ from src.config.settings import settings
 from src.services.case_service import CaseService
 from src.services.llm_service import LLMService
 from src.models.embeddings import EmbeddingService
+from src.services.training_service import TrainingService
 
 # Configure logging
 logging.basicConfig(level=settings.log_level.upper())
@@ -39,6 +40,7 @@ app.add_middleware(
 # Initialize services
 llm_service = LLMService()
 case_service = CaseService(llm_service=llm_service)
+training_service = TrainingService()
 
 # Request/Response Models
 class CaseCreate(BaseModel):
@@ -245,6 +247,84 @@ async def health_check():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Service unavailable"
+        )
+
+@app.post("/train", tags=["training"])
+async def train_model(
+    cases: Optional[List[Dict[str, Any]]] = Body(None),
+    cases_file: UploadFile = File(None),
+    output_dir: str = "./trained_models/case_model"
+):
+    """
+    Train a model on case data.
+    
+    Args:
+        cases: List of case dictionaries containing training data
+        cases_file: JSON file containing cases (alternative to cases parameter)
+        output_dir: Directory to save the trained model
+    """
+    try:
+        training_data = cases
+        
+        # If no cases provided directly, check for file upload
+        if not training_data and cases_file:
+            try:
+                content = await cases_file.read()
+                data = json.loads(content)
+                # Handle both direct cases array and metadata wrapper format
+                training_data = data.get('cases', data) if isinstance(data, dict) else data
+            except json.JSONDecodeError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid JSON file"
+                )
+        
+        if not training_data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No training data provided. Either 'cases' or 'cases_file' must be provided."
+            )
+            
+        training_service.train_model(training_data, output_dir)
+        return JSONResponse(
+            content={
+                "status": "success",
+                "message": f"Model training completed. Saved to {output_dir}",
+                "training_samples": len(training_data)
+            },
+            status_code=status.HTTP_200_OK
+        )
+    except Exception as e:
+        logger.error(f"Training failed: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Training failed: {str(e)}"
+        )
+
+@app.post("/load-model", tags=["training"])
+async def load_trained_model(
+    model_path: str
+):
+    """
+    Load a previously trained model.
+    
+    Args:
+        model_path: Path to the trained model directory
+    """
+    try:
+        training_service.load_trained_model(model_path)
+        return JSONResponse(
+            content={
+                "status": "success",
+                "message": f"Model loaded from {model_path}"
+            },
+            status_code=status.HTTP_200_OK
+        )
+    except Exception as e:
+        logger.error(f"Failed to load model: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to load model: {str(e)}"
         )
 
 # Error handlers

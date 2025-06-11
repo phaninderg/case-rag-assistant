@@ -30,25 +30,26 @@ python-slugify==8.0.1
 urllib3==1.26.16
 
 # LLM and Embedding Providers
-openai==0.27.8
-huggingface-hub==0.14.1
-transformers==4.28.1
-sentence-transformers==2.2.2
-safetensors==0.3.1
-accelerate==0.18.0
-bitsandbytes==0.39.1
-ctransformers==0.2.27
-llama-cpp-python==0.1.78
+openai>=1.0.0
+huggingface-hub==0.16.4  # Specific version that works with transformers
+transformers==4.30.2  # Specific version that works with huggingface-hub
+sentence-transformers==2.2.2  # Specific version that works with both
+safetensors>=0.3.1
+accelerate>=0.25.0
+bitsandbytes>=0.39.0
+ctransformers>=0.2.27
+llama-cpp-python>=0.1.78
+datasets==2.14.5  # Specific version for compatibility
 
 # Vector Stores and RAG
 langchain==0.0.267  # Updated to a version compatible with pydantic v1
 chromadb==0.4.15  # Updated to a version that works with newer FastAPI
 faiss-cpu==1.7.4
 
-# PyTorch (CPU version for compatibility)
-torch==2.0.1
-torchvision==0.15.2
-torchaudio==2.0.2
+# PyTorch (CPU-only version for compatibility)
+torch>=2.0.0,<3.0.0 --index-url https://download.pytorch.org/whl/cpu
+torchvision>=0.15.2,<0.16.0 --index-url https://download.pytorch.org/whl/cpu
+torchaudio>=2.0.2,<2.1.0 --index-url https://download.pytorch.org/whl/cpu
 
 # Additional dependencies
 tokenizers==0.13.3

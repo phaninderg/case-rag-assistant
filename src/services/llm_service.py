@@ -1,14 +1,15 @@
 import logging
 from typing import Dict, List, Optional, Any, AsyncGenerator
 import torch
+from torch import mps
 from langchain.schema import HumanMessage, SystemMessage, AIMessage, BaseMessage
 from langchain.callbacks.manager import CallbackManager
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from huggingface_hub import login, HfApi
 import os
 
 from src.config.settings import settings
-from src.models.factory import ModelFactory
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,28 @@ class LLMService:
             except Exception as e:
                 logger.warning(f"Failed to login to Hugging Face Hub: {str(e)}")
     
+    def _get_device(self):
+        """Determine the best available device for PyTorch"""
+        # Try CUDA first
+        if torch.cuda.is_available():
+            return "cuda"
+            
+        # Check for MPS (Apple Silicon)
+        try:
+            if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                # Test MPS with a small tensor to verify it works
+                try:
+                    x = torch.ones(1, device='mps')
+                    return "mps"
+                except RuntimeError:
+                    logger.warning("MPS is available but encountered an error. Falling back to CPU.")
+                    return "cpu"
+        except (AttributeError, RuntimeError) as e:
+            logger.warning(f"Error checking for MPS: {e}. Falling back to CPU.")
+            
+        # Default to CPU
+        return "cpu"
+
     def _get_model_kwargs(self, llm_config):
         """Get model initialization kwargs with appropriate defaults."""
         model_kwargs = {}
@@ -70,31 +93,48 @@ class LLMService:
         return model_kwargs
     
     def _initialize_llm(self):
-        """Initialize the language model with proper error handling."""
-        llm_config = settings.get_llm_config(self.model_name)
-        
+        """Initialize the language model with CPU-only configuration."""
         try:
-            logger.info(f"Initializing model: {self.model_name}")
+            # Force CPU usage
+            os.environ['CUDA_VISIBLE_DEVICES'] = ''  # Disable CUDA
+            logger.info("Initializing model with CPU-only configuration")
             
-            # Get model kwargs with appropriate defaults
-            model_kwargs = self._get_model_kwargs(llm_config)
+            # Configure tokenizer
+            tokenizer_kwargs = {
+                'use_fast': True,
+                'padding_side': 'left',
+                'truncation_side': 'left',
+                'trust_remote_code': True
+            }
             
-            # Special handling for smaller models
-            if 'tinyllama' in self.model_name.lower() or 'distilgpt2' in self.model_name.lower():
-                model_kwargs['max_memory'] = {0: '2GB'}  # Limit memory usage
-                model_kwargs['device_map'] = 'auto'  # Let accelerate handle device placement
-            
-            # Initialize the model
-            return ModelFactory.create_llm(
-                llm_config,
-                model_kwargs=model_kwargs,
-                streaming=self.streaming
+            logger.info(f"Loading tokenizer for model: {self.model_name}")
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name,
+                **tokenizer_kwargs
             )
+            
+            logger.info(f"Loading model: {self.model_name}")
+            
+            # Create text generation pipeline with CPU device
+            pipe = pipeline(
+                "text-generation",
+                model=self.model_name,
+                tokenizer=tokenizer,
+                device=-1,  # Force CPU
+                framework="pt",
+                model_kwargs={
+                    'device_map': None,  # Disable device_map when using device
+                    'low_cpu_mem_usage': True
+                }
+            )
+            
+            logger.info(f"Successfully loaded model: {self.model_name}")
+            return pipe
             
         except Exception as e:
             error_msg = f"Error initializing {self.model_name}: {str(e)}"
-            logger.error(error_msg)
-            raise RuntimeError(f"Failed to initialize model. {error_msg}")
+            logger.error(error_msg, exc_info=True)
+            raise RuntimeError(error_msg)
     
     def _truncate_text(self, text: str, max_tokens: int = 1000) -> str:
         """Truncate text to a maximum number of tokens."""
