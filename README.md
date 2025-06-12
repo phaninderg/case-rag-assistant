@@ -144,3 +144,68 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [LangChain](https://python.langchain.com/)
 - [FastAPI](https://fastapi.tiangolo.com/)
 - [ChromaDB](https://www.trychroma.com/)
+
+## 🚀 Model Selection and Embedding Capabilities
+
+### Model Selection
+
+The system supports multiple LLM and embedding models. You can switch between different models using the `model_name` parameter in the API requests.
+
+### Embedding Models
+
+The system supports different embedding models for vector search. You can configure the embedding model using the `embedding_service` module.
+
+```python
+# Example: Update embedding model
+embedding_service.update_embedding_model(
+    model_name="sentence-transformers/all-mpnet-base-v2",
+    model_path=None  # Optional local path
+)
+```
+
+### Custom Models
+
+You can use custom models from Hugging Face Hub or local paths.
+
+```json
+{
+  "model_name": "username/model-name"
+}
+```
+
+```json
+{
+  "model_name": "custom-model",
+  "model_path": "/path/to/model"
+}
+```
+
+## 🔧 Configuration
+
+### Environment Variables
+
+```env
+# Required
+DEFAULT_LLM=default
+DEFAULT_EMBEDDING=sentence-transformers/all-mpnet-base-v2
+
+# Optional
+HUGGINGFACE_API_KEY=your-hf-token
+MODEL_CACHE_DIR=./model_cache
+```
+
+## 📦 Project Structure
+
+```
+case-rag-assistant/
+├── src/
+│   ├── config/         # Configuration files
+│   ├── models/         # Data models and embeddings
+│   ├── services/       # Core services
+│   ├── utils/          # Utility functions
+│   └── app.py          # FastAPI application
+├── trained_models/     # Saved models
+├── tests/              # Test cases
+├── requirements.txt    # Python dependencies
+└── README.md          # This file
+```

@@ -1,7 +1,9 @@
 from typing import List, Dict, Any, Optional, Union
 import os
 import logging
+import numpy as np
 from pathlib import Path
+from datetime import datetime
 
 from langchain.vectorstores import Chroma
 from langchain.docstore.document import Document
@@ -27,11 +29,7 @@ class EmbeddingService:
         self.embeddings = ModelFactory.create_embeddings(self.embedding_config)
         
         # Initialize vector store
-        self.vector_store = Chroma(
-            collection_name="case_embeddings",
-            embedding_function=self.embeddings,
-            persist_directory=str(settings.embeddings_dir)
-        )
+        self.vector_store = self._initialize_vector_store()
         
         # Configure text splitting
         self.text_splitter = RecursiveCharacterTextSplitter(
@@ -40,6 +38,215 @@ class EmbeddingService:
             length_function=len,
             add_start_index=True,
         )
+    
+    def _initialize_vector_store(self):
+        """Initialize the vector store with the current embedding model"""
+        return Chroma(
+            collection_name="case_embeddings",
+            embedding_function=self.embeddings,
+            persist_directory=str(settings.embeddings_dir)
+        )
+    
+    def update_embedding_model(self, model_name: str, model_path: Optional[str] = None):
+        """
+        Update the embedding model being used
+        
+        Args:
+            model_name: Name of the model to use
+            model_path: Optional path to a local model
+        """
+        try:
+            self.model_name = model_name
+            if model_path:
+                # Load model from local path
+                self.embeddings = ModelFactory.create_embeddings({
+                    'name': model_name,
+                    'path': model_path
+                })
+            else:
+                # Load model from name
+                self.embedding_config = settings.get_embedding_config(model_name)
+                self.embeddings = ModelFactory.create_embeddings(self.embedding_config)
+            
+            # Reinitialize the vector store with the new embeddings
+            self.vector_store = self._initialize_vector_store()
+            logger.info(f"Updated embedding model to {model_name}")
+            
+        except Exception as e:
+            logger.error(f"Failed to update embedding model: {str(e)}")
+            raise
+    
+    def get_embedding(self, text: str) -> List[float]:
+        """
+        Generate an embedding for the given text
+        
+        Args:
+            text: Text to embed
+            
+        Returns:
+            List of floats representing the embedding
+        """
+        try:
+            # Handle empty or None text
+            if not text or not isinstance(text, str) or not text.strip():
+                logger.warning("Empty or invalid text provided for embedding")
+                return [0.0] * self.embeddings.dimensions
+                
+            # Generate embedding
+            embedding = self.embeddings.embed_query(text)
+            
+            # Ensure we have a valid embedding
+            if not embedding or not isinstance(embedding, list) or not all(isinstance(x, (int, float)) for x in embedding):
+                logger.error(f"Invalid embedding generated for text: {text[:100]}...")
+                return [0.0] * self.embeddings.dimensions
+                
+            return embedding
+            
+        except Exception as e:
+            logger.error(f"Error generating embedding: {str(e)}")
+            # Return zero vector of appropriate dimension
+            return [0.0] * (self.embeddings.dimensions if hasattr(self.embeddings, 'dimensions') else 768)
+    
+    def similarity_search(
+        self, 
+        query_embedding: List[float], 
+        k: int = 5, 
+        min_score: float = 0.0
+    ) -> List[Dict[str, Any]]:
+        """
+        Find similar cases using vector similarity search
+        
+        Args:
+            query_embedding: Embedding vector to compare against
+            k: Maximum number of results to return
+            min_score: Minimum similarity score (0-1)
+            
+        Returns:
+            List of similar cases with scores
+        """
+        try:
+            # Convert query embedding to the expected format
+            if not isinstance(query_embedding, (list, np.ndarray)) or not all(isinstance(x, (int, float, np.number)) for x in query_embedding):
+                logger.error("Invalid query embedding format")
+                return []
+            
+            # Convert to numpy array if needed, then to list
+            if not isinstance(query_embedding, np.ndarray):
+                query_embedding = np.array(query_embedding)
+            
+            # Convert to Python list for ChromaDB compatibility
+            query_embedding_list = query_embedding.tolist()
+            
+            # Get documents and scores in one go using the vector
+            results = self.vector_store.similarity_search_by_vector(
+                embedding=query_embedding_list,
+                k=k
+            )
+            
+            # Get the scores using the collection's query method directly
+            collection = self.vector_store._collection
+            query_results = collection.query(
+                query_embeddings=[query_embedding_list],
+                n_results=k
+            )
+            
+            # Process and filter results
+            processed_results = []
+            for i, doc in enumerate(results):
+                if i < len(query_results['distances'][0]):
+                    # Get the score (distance) for this document
+                    distance = query_results['distances'][0][i]
+                    # Convert distance to similarity score (1 - distance for cosine similarity)
+                    similarity = 1.0 - float(distance)
+                    
+                    if similarity >= min_score:
+                        metadata = doc.metadata
+                        processed_results.append({
+                            'case_number': metadata.get('case_number', 'N/A'),
+                            'subject': metadata.get('subject', 'No subject'),
+                            'description': doc.page_content,
+                            'similarity_score': similarity,
+                            'metadata': metadata
+                        })
+            
+            # Sort by similarity score (highest first)
+            processed_results.sort(key=lambda x: x['similarity_score'], reverse=True)
+            
+            return processed_results
+            
+        except Exception as e:
+            logger.error(f"Error in similarity search: {str(e)}", exc_info=True)
+            return []
+    
+    def add_case(self, case_data: Dict[str, Any]) -> bool:
+        """
+        Add a case to the vector store
+        
+        Args:
+            case_data: Dictionary containing case data
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Extract relevant fields
+            case_number = case_data.get('case_number')
+            if not case_number:
+                logger.error("Case number is required")
+                return False
+                
+            # Prepare document
+            text = f"{case_data.get('subject', '')}\n\n{case_data.get('description', '')}"
+            metadata = {
+                'case_number': case_number,
+                'subject': case_data.get('subject', ''),
+                'created_at': datetime.utcnow().isoformat()
+            }
+            
+            # Add to vector store
+            self.vector_store.add_documents([Document(page_content=text, metadata=metadata)])
+            
+            # Persist changes
+            self.vector_store.persist()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error adding case to vector store: {str(e)}")
+            return False
+    
+    def get_all_cases(self) -> List[Dict[str, Any]]:
+        """
+        Get all cases from the vector store
+        
+        Returns:
+            List of case documents
+        """
+        try:
+            # Get all document IDs
+            collection = self.vector_store._collection
+            if not collection:
+                return []
+                
+            # Get all documents
+            docs = collection.get(include=['metadatas', 'documents'])
+            if not docs or 'metadatas' not in docs or 'documents' not in docs:
+                return []
+                
+            # Format results
+            results = []
+            for i, (metadata, content) in enumerate(zip(docs['metadatas'], docs['documents'])):
+                results.append({
+                    'id': i,
+                    'content': content,
+                    'metadata': metadata or {}
+                })
+                
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error getting all cases: {str(e)}")
+            return []
     
     def add_document(self, case_number: str, text: str, metadata: Dict[str, Any]):
         """
@@ -66,83 +273,121 @@ class EmbeddingService:
         self.vector_store.add_documents(docs)
         self.vector_store.persist()
     
-    def search_similar(self, query: str, k: int = 5, **kwargs) -> List[Dict[str, Any]]:
+    def get_vector_store_info(self) -> Dict[str, Any]:
+        """
+        Get information about the vector store contents.
+        
+        Returns:
+            Dictionary with vector store information
+        """
+        try:
+            collection = self.vector_store._collection
+            return {
+                "num_documents": collection.count(),
+                "embedding_dimension": len(collection.peek(1)['embeddings'][0]) if collection.count() > 0 else 0,
+                "collection_name": collection.name,
+                "persist_directory": str(self.vector_store._persist_directory)
+            }
+        except Exception as e:
+            logger.error(f"Error getting vector store info: {str(e)}")
+            return {"error": str(e)}
+
+    def search_similar(self, query: str, k: int = 5, min_score: float = 0.5, **kwargs) -> List[Dict[str, Any]]:
         """
         Search for documents similar to the query.
         
         Args:
             query: The search query
             k: Number of results to return
+            min_score: Minimum similarity score (0-1)
             **kwargs: Additional search parameters
             
         Returns:
             List of similar documents with scores
         """
-        # Perform similarity search
-        docs_and_scores = self.vector_store.similarity_search_with_score(
-            query,
-            k=min(k, 20),  # Limit max results
-            **kwargs
-        )
-        
-        # Format results
+        try:
+            logger.info(f"Searching for query: '{query}' with k={k}, min_score={min_score}")
+            
+            # Get query embedding
+            try:
+                if hasattr(self.embeddings, 'encode'):
+                    query_embedding = self.embeddings.encode(query, convert_to_tensor=False)
+                    if hasattr(query_embedding, 'tolist'):
+                        query_embedding = query_embedding.tolist()
+                    logger.debug(f"Generated query embedding of length: {len(query_embedding)}")
+                else:
+                    logger.error("Embedding model does not support 'encode' method")
+                    return []
+            except Exception as e:
+                logger.error(f"Error generating query embedding: {str(e)}")
+                return []
+            
+            # Perform similarity search
+            try:
+                # First try with the query embedding
+                docs_and_scores = self.vector_store.similarity_search_with_score(
+                    query_embedding,
+                    k=min(k * 2, 20),  # Get more results to filter by score
+                    **kwargs
+                )
+                
+                # Format and filter results
+                results = []
+                for doc, score in docs_and_scores:
+                    similarity = 1.0 - score  # Convert distance to similarity
+                    if similarity >= min_score:
+                        results.append({
+                            "content": doc.page_content,
+                            "metadata": doc.metadata,
+                            "score": similarity
+                        })
+                
+                # Sort by score (highest first) and limit to k results
+                results.sort(key=lambda x: x['score'], reverse=True)
+                results = results[:k]
+                
+                logger.info(f"Found {len(results)} results with scores >= {min_score}")
+                if results:
+                    logger.debug(f"Top result score: {results[0]['score']:.4f}, Content: {results[0]['content'][:100]}...")
+                
+                return results
+                
+            except Exception as e:
+                logger.error(f"Error in similarity search: {str(e)}", exc_info=True)
+                return []
+                
+        except Exception as e:
+            logger.error(f"Unexpected error in search_similar: {str(e)}", exc_info=True)
+            return []
+    
+    def _format_search_results(self, docs_and_scores) -> List[Dict[str, Any]]:
+        """Format search results into a consistent format."""
         results = []
         for doc, score in docs_and_scores:
-            result = {
-                "content": doc.page_content,
-                "metadata": doc.metadata,
-                "score": float(score)
-            }
-            results.append(result)
-        
-        return results
-    
-    def get_all_cases(self) -> List[Dict[str, Any]]:
-        """
-        Get all cases from the vector store with their metadata.
-        
-        Returns:
-            List of cases with their chunks and metadata
-        """
-        # Get all documents from the collection
-        collection = self.vector_store._collection
-        if collection is None:
-            return []
-            
-        results = collection.get()
-        
-        # Group chunks by case_number
-        cases = {}
-        for i, (doc_id, doc_text, metadata) in enumerate(zip(
-            results["ids"],
-            results["documents"],
-            results["metadatas"]
-        )):
-            case_number = metadata.get("case_number")
-            if not case_number:
-                continue
+            try:
+                if hasattr(doc, 'page_content'):
+                    content = doc.page_content
+                    metadata = getattr(doc, 'metadata', {})
+                elif hasattr(doc, 'content'):
+                    content = doc.content
+                    metadata = {k: v for k, v in doc.__dict__.items() if k != 'content'}
+                else:
+                    content = str(doc)
+                    metadata = {}
                 
-            if case_number not in cases:
-                cases[case_number] = {
-                    "case_number": case_number,
-                    "subject": metadata.get("subject", ""),
-                    "created_at": metadata.get("created_at"),
-                    "chunks": [],
-                    "metadata": {k: v for k, v in metadata.items() 
-                                 if k not in ["chunk", "chunk_size", "case_number"]}
+                result = {
+                    "content": content,
+                    "metadata": metadata,
+                    "score": float(1.0 - score) if not isinstance(score, dict) else score.get('score', 0.0)
                 }
-            
-            cases[case_number]["chunks"].append({
-                "chunk_id": metadata.get("chunk", i),
-                "text": doc_text,
-                "length": len(doc_text)
-            })
+                results.append(result)
+            except Exception as e:
+                logger.warning(f"Error formatting search result: {str(e)}")
+                continue
         
-        # Sort chunks by chunk_id
-        for case in cases.values():
-            case["chunks"].sort(key=lambda x: x["chunk_id"])
-        
-        return list(cases.values())
+        # Sort by score (highest first)
+        results.sort(key=lambda x: x['score'], reverse=True)
+        return results
     
     def _prepare_documents(self, text: str, metadata: Dict[str, Any]) -> List[Document]:
         """

@@ -8,6 +8,5 @@ src/utils/__pycache__/
 data/embeddings/
 .idea/
 debug/
-cases.json
 import.log
 trained_models/
