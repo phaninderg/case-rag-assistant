@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, status, Query, Body, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, status, Query, Body, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl
@@ -7,6 +7,7 @@ import logging
 import json
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 # Update imports to use absolute paths
 from src.config.settings import settings
@@ -38,8 +39,9 @@ app.add_middleware(
 )
 
 # Initialize services
-llm_service = LLMService()
-case_service = CaseService(llm_service=llm_service)
+case_service = CaseService()
+llm_service = LLMService(case_service=case_service)
+case_service.llm_service = llm_service  # Set up circular dependency if needed
 training_service = TrainingService()
 
 # Request/Response Models
@@ -60,23 +62,43 @@ class CaseResponse(CaseCreate):
         from_attributes = True
 
 class CaseSearchRequest(BaseModel):
-    query: str
-    k: int = Field(5, ge=1, le=20)
-    include_details: bool = False
+    query: str = Field(..., description="Search query")
+    k: int = Field(5, ge=1, le=20, description="Maximum number of results to return")
+    min_score: float = Field(0.6, ge=0.0, le=1.0, description="Minimum similarity score (0-1)")
+    include_solutions: bool = Field(True, description="Whether to include AI-generated solutions")
+    model_name: Optional[str] = Field(None, description="Optional model name to use for search")
+    model_path: Optional[str] = Field(None, description="Optional path to a local model")
 
-class CaseSearchResponse(BaseModel):
-    results: Union[List[Dict[str, Any]], str]
-    metadata: Dict[str, Any]
+class SearchResult(BaseModel):
+    solution: str = Field(..., description="The generated solution text")
+    similarity_score: float = Field(..., ge=0.0, le=1.0, description="Similarity score between query and result (0-1)")
+    case_number: str = Field(..., description="The case number for reference")
+
+class SearchResponse(BaseModel):
+    results: List[SearchResult]
+    query: str
+    total_results: int
+    metadata: Dict[str, Any] = {}
 
 class CaseSummaryRequest(BaseModel):
-    include_similar: bool = True
-    similar_k: int = Field(3, ge=1, le=5)
+    model_name: Optional[str] = None
+    model_path: Optional[str] = None
+
+class TrainModelRequest(BaseModel):
+    cases: Optional[List[Dict[str, Any]]] = None
+    cases_file: Optional[UploadFile] = None
+    output_dir: str = "./trained_models/case_model"
 
 class LLMConfigUpdate(BaseModel):
     model_name: Optional[str] = None
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     streaming: Optional[bool] = None
+
+class TrainRequest(BaseModel):
+    output_dir: str = "./trained_models/case_model"
+    epochs: int = 3
+    learning_rate: float = 2e-5
 
 # API Endpoints
 @app.post("/api/cases", response_model=CaseResponse, status_code=status.HTTP_201_CREATED)
@@ -116,36 +138,36 @@ async def get_case(case_number: str):
         )
     return case
 
-@app.post("/api/cases/search", response_model=CaseSearchResponse)
+@app.post("/api/cases/search", response_model=SearchResponse)
 async def search_cases(search_request: CaseSearchRequest):
-    """Search for cases similar to the query."""
+    """
+    Search for similar cases and provide potential solutions.
+    
+    This endpoint uses semantic search to find cases similar to the query
+    and can generate AI-powered solutions for the found cases.
+    """
     try:
-        response = await case_service.search_cases(
+        # Perform the search
+        results = await llm_service.search_similar_cases(
             query=search_request.query,
             k=search_request.k,
-            include_details=search_request.include_details
+            min_score=search_request.min_score,
+            include_solutions=search_request.include_solutions
         )
         
-        # If include_details is True, the response is already a string from the LLM
-        if search_request.include_details:
-            return {
-                "results": response,
-                "metadata": {
-                    "query": search_request.query,
-                    "result_count": 1 if response != "I couldn't find any relevant cases matching your query." else 0
-                }
-            }
-        
-        # Otherwise, it's a list of results
         return {
-            "results": response,
+            "results": results,
+            "query": search_request.query,
+            "total_results": len(results),
             "metadata": {
-                "query": search_request.query,
-                "result_count": len(response)
+                "model": llm_service.model_name,
+                "include_solutions": search_request.include_solutions,
+                "min_score": search_request.min_score
             }
         }
+        
     except Exception as e:
-        logger.error(f"Error searching cases: {str(e)}")
+        logger.error(f"Search failed: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Search failed: {str(e)}"
@@ -158,14 +180,17 @@ async def summarize_case(
 ):
     """Generate a summary of a case using the LLM.
     
-    Returns:
-        str: The generated summary as plain text
+    Returns a concise 4-5 sentence summary focusing on the core problem.
     """
     try:
         if request is None:
             request = CaseSummaryRequest()
             
-        summary = await case_service.generate_case_summary(case_number)
+        summary = await case_service.generate_case_summary(
+            case_number=case_number,
+            model_name=request.model_name, 
+            model_path=request.model_path
+        )
         return summary
         
     except ValueError as e:
@@ -174,10 +199,38 @@ async def summarize_case(
             detail=str(e)
         )
     except Exception as e:
-        logger.error(f"Error generating summary: {str(e)}")
+        logger.error(f"Error generating summary: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate summary: {str(e)}"
+        )
+
+@app.get("/api/vector-store/status")
+async def get_vector_store_status():
+    """
+    Get information about the vector store status.
+    
+    Returns:
+        Dict with vector store information
+    """
+    try:
+        embedding_service = EmbeddingService()
+        status_info = embedding_service.get_vector_store_info()
+        
+        # Add additional debug info
+        status_info.update({
+            "embedding_model": embedding_service.model_name,
+            "embedding_config": str(embedding_service.embedding_config),
+            "is_embedding_model_loaded": hasattr(embedding_service.embeddings, 'model') or hasattr(embedding_service.embeddings, 'client')
+        })
+        
+        return status_info
+        
+    except Exception as e:
+        logger.error(f"Error getting vector store status: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error getting vector store status: {str(e)}"
         )
 
 @app.post("/api/llm/config")
@@ -188,6 +241,7 @@ async def update_llm_config(config: LLMConfigUpdate):
         
         # Create new LLM service with updated config
         new_llm_service = LLMService(
+            case_service=case_service,
             model_name=config.model_name or llm_service.model_name,
             temperature=config.temperature if config.temperature is not None else llm_service.llm.temperature,
             max_tokens=config.max_tokens if config.max_tokens is not None else llm_service.llm.max_tokens,
@@ -251,12 +305,10 @@ async def health_check():
 
 @app.post("/train", tags=["training"])
 async def train_model(
-    cases: Optional[List[Dict[str, Any]]] = Body(None),
-    cases_file: UploadFile = File(None),
-    output_dir: str = "./trained_models/case_model"
+    request: TrainModelRequest
 ):
     """
-    Train a model on case data.
+    Train a model on case data with instruction fine-tuning.
     
     Args:
         cases: List of case dictionaries containing training data
@@ -264,12 +316,12 @@ async def train_model(
         output_dir: Directory to save the trained model
     """
     try:
-        training_data = cases
+        training_data = request.cases
         
         # If no cases provided directly, check for file upload
-        if not training_data and cases_file:
+        if not training_data and request.cases_file:
             try:
-                content = await cases_file.read()
+                content = await request.cases_file.read()
                 data = json.loads(content)
                 # Handle both direct cases array and metadata wrapper format
                 training_data = data.get('cases', data) if isinstance(data, dict) else data
@@ -284,16 +336,32 @@ async def train_model(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="No training data provided. Either 'cases' or 'cases_file' must be provided."
             )
+        
+        # Ensure output directory exists
+        output_dir = Path(request.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Train the model
+        result = training_service.train_model(training_data, str(output_dir))
+        
+        if result["status"] != "success":
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=result.get("message", "Training failed")
+            )
             
-        training_service.train_model(training_data, output_dir)
         return JSONResponse(
             content={
                 "status": "success",
-                "message": f"Model training completed. Saved to {output_dir}",
+                "message": "Model training completed successfully",
+                "model_path": result["model_path"],
                 "training_samples": len(training_data)
             },
             status_code=status.HTTP_200_OK
         )
+        
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Training failed: {str(e)}", exc_info=True)
         raise HTTPException(
@@ -303,7 +371,7 @@ async def train_model(
 
 @app.post("/load-model", tags=["training"])
 async def load_trained_model(
-    model_path: str
+    model_path: str = Body(..., embed=True, description="Path to the trained model directory")
 ):
     """
     Load a previously trained model.
@@ -312,19 +380,87 @@ async def load_trained_model(
         model_path: Path to the trained model directory
     """
     try:
+        # Verify the model path exists
+        model_dir = Path(model_path)
+        if not model_dir.exists() or not model_dir.is_dir():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Model directory not found: {model_path}"
+            )
+            
+        # Load the model using the LLMService
         training_service.load_trained_model(model_path)
-        return JSONResponse(
-            content={
-                "status": "success",
-                "message": f"Model loaded from {model_path}"
-            },
-            status_code=status.HTTP_200_OK
-        )
+        llm_service.load_model(model_path)
+        
+        return {
+            "status": "success",
+            "message": f"Model loaded from {model_path}",
+            "model_path": model_path
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Failed to load model: {str(e)}")
+        logger.error(f"Failed to load model: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to load model: {str(e)}"
+        )
+
+@app.post("/api/train", status_code=200)
+async def train_model(
+    cases_file: UploadFile = File(...),
+    output_dir: str = Form("./trained_models/case_model"),
+    epochs: int = Form(3),
+    learning_rate: float = Form(2e-5)
+):
+    """
+    Train a new model on the provided cases.
+    
+    Args:
+        cases_file: JSON file containing cases (required)
+        output_dir: Directory to save the trained model
+        epochs: Number of training epochs
+        learning_rate: Learning rate for training
+        
+    Returns:
+        dict: Status and path to the trained model
+    """
+    try:
+        # Read and parse the uploaded file
+        content = await cases_file.read()
+        try:
+            data = json.loads(content)
+            # Handle both direct cases array and metadata wrapper format
+            training_data = data.get('cases', data) if isinstance(data, dict) else data
+            if not isinstance(training_data, list):
+                raise ValueError("Invalid file format: expected a JSON array or object with 'cases' key")
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid JSON file"
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid training data format: {str(e)}"
+            )
+            
+        # Train the model
+        output_dir = training_service.train(
+            cases=training_data,
+            output_dir=output_dir,
+            num_train_epochs=epochs,
+            learning_rate=learning_rate
+        )
+        return {"status": "success", "model_path": output_dir}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Training failed: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Training failed: {str(e)}"
         )
 
 # Error handlers

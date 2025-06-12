@@ -3,6 +3,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union, AsyncGenerator
+import re
 
 from langchain.docstore.document import Document
 
@@ -190,142 +191,171 @@ class CaseService:
         query: str, 
         k: int = 5, 
         include_details: bool = False,
-        min_score: float = 0.7
+        model_name: Optional[str] = None,
+        model_path: Optional[str] = None
     ) -> Union[List[Dict[str, Any]], str]:
         """
-        Search for cases similar to the query using vector similarity search.
+        Search for cases similar to the query.
         
         Args:
-            query: The search query
-            k: Maximum number of results to return (1-20)
-            include_details: If True, returns a natural language response with case references
-            min_score: Minimum similarity score (0-1) for results to be included
+            query: Search query string
+            k: Number of results to return
+            include_details: Whether to include detailed LLM analysis
+            model_name: Optional model name to use for search
+            model_path: Optional path to a local model
             
         Returns:
-            If include_details is False: List of case results with scores
-            If include_details is True: Natural language response with case references
-            
-        Raises:
-            ValueError: If LLM service is not available for include_details=True
+            List of matching cases or formatted string with analysis
         """
         try:
-            # First, try vector similarity search
-            vector_results = self.embedding_service.vector_store.similarity_search_with_score(
-                query,
-                k=min(k * 2, 20)  # Get more results to filter by score
+            # Load the specified model if different from current
+            if model_name or model_path:
+                self.llm_service.load_model(
+                    model_name=model_name or "default",
+                    model_path=model_path
+                )
+                
+            # Generate query embedding
+            query_embedding = self.llm_service.get_embedding(query)
+            
+            # Find similar cases
+            results = self.embedding_service.similarity_search(
+                query_embedding=query_embedding,
+                k=k
             )
             
-            # Filter results by score and format
-            results = []
-            seen_cases = set()
+            if not include_details:
+                return results
+                
+            # Generate detailed analysis using LLM
+            context = "\n".join(
+                f"Case {i+1}:\n"
+                f"Subject: {res['subject']}\n"
+                f"Description: {res['description']}\n"
+                f"Relevance Score: {res['score']:.4f}\n"
+                for i, res in enumerate(results)
+            )
             
-            for doc, score in vector_results:
-                if score > min_score:
-                    continue
-                    
-                metadata = doc.metadata
-                case_number = metadata.get('case_number')
+            prompt = (
+                f"Analyze these search results for the query: '{query}'\n\n"
+                f"{context}\n\n"
+                "Provide a concise analysis of the most relevant cases "
+                "and their potential solutions."
+            )
+            
+            analysis = await self.llm_service.generate_response(prompt)
+            return analysis
+            
+        except Exception as e:
+            logger.error(f"Error in case search: {str(e)}", exc_info=True)
+            raise
+
+    async def generate_case_summary(
+        self,
+        case_number: str,
+        model_name: Optional[str] = None,
+        model_path: Optional[str] = None
+    ) -> str:
+        """
+        Generate a concise summary of a case's description.
+        
+        Args:
+            case_number: The case number to summarize
+            model_name: Optional model name to use
+            model_path: Optional path to a local model
+            
+        Returns:
+            str: A 4-5 sentence summary of the core problem
+        """
+        try:
+            # Get the case details
+            case = self.get_case(case_number)
+            if not case:
+                raise ValueError(f"Case with number {case_number} not found")
                 
-                # Skip if we've already seen this case (to avoid duplicates)
-                if case_number in seen_cases:
-                    continue
-                    
-                seen_cases.add(case_number)
-                
-                # Get full case details
-                case = self.get_case(case_number)
-                if case:
-                    results.append({
-                        **case,
-                        'relevance_score': 1.0 - score,  # Convert distance to similarity score
-                        'match_reason': f"Vector similarity: {1.0 - score:.2f}"
-                    })
-                
-                if len(results) >= k:
+            subject = case.get('subject', '').strip()
+            description = case.get('description', '').strip()
+            
+            if not description:
+                return f"No description available for case {case_number}."
+            
+            # Extract the main issue from the description
+            issue_section = ""
+            issue_markers = [
+                "Issue Definition:",
+                "Problem Description:",
+                "Issue:",
+                "Problem:",
+                "Description:"
+            ]
+            
+            for marker in issue_markers:
+                if marker in description:
+                    # Get text after the marker
+                    issue_text = description.split(marker, 1)[1]
+                    # Take text until the next section or end
+                    issue_text = re.split(r'\n[A-Z][a-z]+:', issue_text)[0]
+                    issue_section = issue_text.strip()
                     break
             
-            # If no results from vector search, try keyword search as fallback
-            if not results:
-                logger.warning(f"No vector search results for query: {query}")
-                
-                # Get all cases and do simple keyword matching
-                all_cases = self.embedding_service.get_all_cases()
-                for case in all_cases:
-                    metadata = case.get('metadata', {})
-                    case_number = metadata.get('case_number')
-                    
-                    if not case_number or case_number in seen_cases:
-                        continue
-                        
-                    seen_cases.add(case_number)
-                    case_details = self.get_case(case_number)
-                    
-                    if not case_details:
-                        continue
-                    
-                    # Simple keyword matching
-                    text_to_search = f"{case_details.get('subject', '')} {case_details.get('description', '')}".lower()
-                    query_terms = query.lower().split()
-                    
-                    # Count matching terms
-                    matches = sum(1 for term in query_terms if term in text_to_search)
-                    if matches > 0:
-                        results.append({
-                            **case_details,
-                            'relevance_score': min(0.7, matches * 0.1),  # Cap at 0.7 for keyword matches
-                            'match_reason': f"Keyword match: {matches} terms"
-                        })
-                    
-                    if len(results) >= k:
-                        break
+            # If no specific issue section found, use the beginning of the description
+            if not issue_section:
+                issue_section = ' '.join(description.split('\n')[:10])
             
-            # Sort results by relevance score (highest first)
-            results.sort(key=lambda x: x.get('relevance_score', 0), reverse=True)
+            # Clean up the text
+            issue_section = re.sub(r'<<[^>]*>>', '', issue_section)  # Remove template markers
+            issue_section = re.sub(r'https?://\S+', '', issue_section)  # Remove URLs
+            issue_section = ' '.join(issue_section.split())  # Normalize whitespace
             
-            # If include_details is True, generate a natural language response
-            if include_details and self.llm_service:
-                return await self._generate_search_response(query, results[:k])
+            if not issue_section:
+                return f"Unable to extract issue details from case {case_number}."
+            
+            # Prepare a focused prompt with clear instructions
+            prompt = (
+                "Provide a 4-5 sentence summary of the following issue. "
+                "Focus on the core problem and its impact. Be specific and technical.\n\n"
+                f"Subject: {subject}\n\n"
+                f"Details: {issue_section[:1500]}"
+            )
+            
+            # Generate the summary
+            response = await self.llm_service.generate_response(
+                prompt=prompt,
+                max_length=500,
+                temperature=0.3,
+                top_p=0.9,
+                do_sample=False,
+                max_new_tokens=300
+            )
+            
+            # Clean up the response
+            summary = response.strip()
+            
+            # Remove any instance of the prompt in the response
+            summary = summary.replace(prompt, '').strip()
+            
+            # Remove any remaining quotes and extra whitespace
+            summary = re.sub(r'^["\']|["\']$', '', summary)
+            summary = re.sub(r'\s+', ' ', summary).strip()
+            
+            # If the summary still looks like it contains the prompt, try to extract just the summary part
+            if 'Subject:' in summary and 'Details:' in summary:
+                summary = summary.split('Details:')[-1].strip()
+            
+            # Ensure we have a valid summary
+            if not summary or len(summary.split()) < 10:
+                # Fallback: return a simple summary based on the subject and first part of the issue
+                return (
+                    f"Issue with {subject}. "
+                    f"{issue_section[:300]}"
+                )
                 
-            return results[:k]
+            return summary
             
         except Exception as e:
-            logger.error(f"Error in search_cases: {str(e)}", exc_info=True)
-            if include_details:
-                return f"An error occurred while searching: {str(e)}"
-            return []
-    
-    async def _generate_search_response(self, query: str, results: List[Dict[str, Any]]) -> str:
-        """Generate a concise natural language response for search results."""
-        if not results:
-            return "I couldn't find any relevant cases matching your query."
-            
-        # Get the most relevant case
-        most_relevant = results[0]
-        
-        prompt = f"""
-        You are a helpful support assistant. Provide a concise response (max 5 lines) 
-        to the user's query based on the following case information.
-        
-        User Query: "{query}"
-        
-        Most Relevant Case:
-        - Subject: {most_relevant.get('subject', 'No subject')}
-        - Description: {most_relevant.get('description', 'No description available')[:500]}
-        
-        Provide a brief, helpful response that addresses the user's query using the case information.
-        Focus on the key points and keep it concise (max 5 lines).
-        """
-        
-        try:
-            response = await self.llm_service.generate(prompt)
-            # Ensure the response is exactly 5 lines
-            lines = [line.strip() for line in response.strip().split('\n') if line.strip()]
-            return '\n'.join(lines[:5])
-        except Exception as e:
-            logger.error(f"Error generating search response: {str(e)}")
-            # Fall back to a simple response if LLM fails
-            return f"Based on case {most_relevant.get('case_number', 'N/A')}: {most_relevant.get('subject', 'No subject')}"
-    
+            logger.error(f"Error generating case summary: {str(e)}", exc_info=True)
+            return f"Error generating summary: {str(e)}"
+
     async def get_related_cases(self, case_number: str, k: int = 3) -> List[Dict[str, Any]]:
         """
         Find cases related to the given case using LLM.
@@ -360,123 +390,137 @@ class CaseService:
             c for c in related_cases 
             if c['case_number'] != case_number
         ][:k]
-    
-    async def generate_case_summary(self, case_number: str) -> str:
+
+    async def find_similar_cases(
+        self,
+        query: str,
+        k: int = 5,
+        min_score: float = 0.5,  # Lowered default min_score
+        **kwargs
+    ) -> List[Dict[str, Any]]:
         """
-        Generate a detailed and comprehensive summary of a case using LLM.
+        Find similar cases using vector similarity search.
         
         Args:
-            case_number: The case number to summarize
+            query: The search query
+            k: Number of results to return
+            min_score: Minimum similarity score (0-1)
+            **kwargs: Additional search parameters
             
         Returns:
-            Generated summary text (5-7 sentences)
-            
-        Raises:
-            ValueError: If LLM service is not available or case not found
+            List of Document objects with metadata and scores
         """
-        if not self.llm_service:
-            raise ValueError("LLM service is required for summarization")
-                
-        case = self.get_case(case_number)
-        if not case:
-            raise ValueError(f"Case {case_number} not found")
-        
-        # Get full subject and description without any trimming
-        subject = case.get('subject', 'No subject')
-        description = case.get('description', '')
-        
-        # Create a structured prompt with clear instructions
-        prompt = f"""You are a technical support analyst summarizing a support case. 
-        Generate a detailed 5-7 sentence summary following this exact structure:
-        
-        1. [First sentence: Clearly state the main issue or request]
-        2. [Second sentence: Describe the impact and urgency]
-        3. [Third sentence: Mention any troubleshooting steps already taken]
-        4. [Fourth sentence: Note any error messages or specific symptoms]
-        5. [Fifth sentence: Describe the current status]
-        6. [Sixth sentence: Mention any next steps or recommendations]
-        7. [Seventh sentence: Add any additional context if needed]
-        
-        CASE SUBJECT: {subject}
-        
-        FULL CASE DESCRIPTION:
-        {description}
-        
-        DETAILED SUMMARY (EXACTLY 5-7 SENTENCES):
-        """
-        
         try:
-            # Use parameters optimized for detailed, structured responses
-            response = await self.llm_service.generate(
-                prompt,
-                max_tokens=500,     # Increased for more detailed responses
-                temperature=0.5,    # Slightly higher for better creativity
-                top_p=0.95,
-                top_k=60,
-                do_sample=True,
-                num_return_sequences=1,
-                no_repeat_ngram_size=3,
-                early_stopping=True,
-                repetition_penalty=1.2,
-                length_penalty=1.3  # Strongly encourage longer responses
-            )
+            logger.info(f"Searching for cases similar to: '{query}'")
             
-            if response and isinstance(response, str):
-                # Clean up the response
-                summary = response.strip()
-                
-                # Ensure we have multiple sentences
-                sentences = [s.strip() for s in summary.split('. ') if s.strip()]
-                if len(sentences) < 3:  # If we don't have enough sentences, try again with a different approach
-                    return await self._generate_alternative_summary(subject, description)
-                    
-                # Join sentences and ensure proper formatting
-                summary = '. '.join(sentences).strip()
-                if not summary.endswith('.'):
-                    summary += '.'
-                    
-                return summary
-                    
+            # First try with the original query
+            results = await self._search_with_embedding(query, k, min_score, **kwargs)
+            
+            # If no results, try with a simpler query
+            if not results and len(query.split()) > 2:
+                logger.info("No results found, trying with simplified query...")
+                simple_query = " ".join(query.split()[:2])  # Use first two words
+                results = await self._search_with_embedding(simple_query, k, min_score, **kwargs)
+            
+            logger.info(f"Found {len(results)} similar cases")
+            return results
+            
         except Exception as e:
-            logger.error(f"Error generating case summary: {str(e)}")
-            
-        # Fallback to alternative generation method
-        return await self._generate_alternative_summary(subject, description)
-    
-    async def _generate_alternative_summary(self, subject: str, description: str) -> str:
-        """Alternative summary generation method if the primary one fails."""
+            logger.error(f"Error in find_similar_cases: {str(e)}", exc_info=True)
+            return []
+
+    async def _search_with_embedding(self, query: str, k: int, min_score: float, **kwargs):
+        """Helper method to perform the actual search with embedding"""
         try:
-            prompt = f"""Generate a detailed 5-7 sentence summary of this support case.
+            logger.info(f"Starting search for query: '{query}' with k={k}, min_score={min_score}")
             
-            Subject: {subject}
-            
-            Description: {description}
-            
-            Please provide a detailed summary with the following structure:
-            1. First sentence: What is the main issue?
-            2. Second sentence: What is the impact?
-            3. Third sentence: What has been tried?
-            4. Fourth sentence: What is the current status?
-            5. Fifth sentence: What are the next steps?
-            6. Sixth sentence: Any additional context?
-            7. Seventh sentence: Final thoughts or recommendations.
-            
-            Summary:"""
-            
-            response = await self.llm_service.generate(
-                prompt,
-                max_tokens=500,
-                temperature=0.6,
-                top_p=0.95,
-                top_k=60,
-                do_sample=True
-            )
-            
-            if response and isinstance(response, str):
-                return response.strip()
+            # Get the query embedding
+            try:
+                if hasattr(self.embedding_service.embeddings, 'embed_query'):
+                    logger.debug("Using embed_query for embedding generation")
+                    query_embedding = self.embedding_service.embeddings.embed_query(query)
+                elif hasattr(self.embedding_service.embeddings, 'encode'):
+                    logger.debug("Using encode for embedding generation")
+                    query_embedding = self.embedding_service.embeddings.encode(
+                        query,
+                        convert_to_tensor=False
+                    )
+                else:
+                    error_msg = "Embedding model doesn't support embed_query or encode methods"
+                    logger.error(error_msg)
+                    return []
                 
-        except Exception as e:
-            logger.error(f"Error in alternative summary generation: {str(e)}")
+                if hasattr(query_embedding, 'tolist'):
+                    query_embedding = query_embedding.tolist()
+                
+                logger.debug(f"Generated query embedding of length: {len(query_embedding) if query_embedding else 0}")
+                if query_embedding and len(query_embedding) > 0:
+                    logger.debug(f"First few values: {query_embedding[:3]}...")
+                
+            except Exception as e:
+                logger.error(f"Error generating embedding: {str(e)}", exc_info=True)
+                return []
             
-        # Final fallback
-        return f"Case: {subject}"
+            # Get the collection directly
+            try:
+                collection = self.embedding_service.vector_store._collection
+                logger.debug(f"Collection info - Name: {collection.name}, Count: {collection.count()}")
+                
+                # Query the collection with the pre-computed embedding
+                logger.debug("Querying collection...")
+                query_results = collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=min(k * 2, 20),  # Get more results to filter by score
+                    include=["metadatas", "documents", "distances"],
+                    **kwargs
+                )
+                
+                logger.debug(f"Query results keys: {query_results.keys() if query_results else 'None'}")
+                if query_results and 'ids' in query_results:
+                    logger.debug(f"Found {len(query_results['ids'][0])} results before filtering")
+                
+                # Process results
+                formatted_results = []
+                if query_results and 'ids' in query_results and query_results['ids'][0]:
+                    for i in range(len(query_results['ids'][0])):
+                        try:
+                            doc_id = query_results['ids'][0][i]
+                            doc_metadata = query_results['metadatas'][0][i] if query_results.get('metadatas') and query_results['metadatas'][0] else {}
+                            doc_content = query_results['documents'][0][i] if query_results.get('documents') and query_results['documents'][0] else ""
+                            distance = query_results['distances'][0][i] if query_results.get('distances') and query_results['distances'][0] else 1.0
+                            
+                            # Convert distance to similarity score (assuming cosine similarity)
+                            # For cosine similarity, the range is [-1, 1], so we normalize to [0, 1]
+                            similarity = (1.0 + (1.0 - distance)) / 2.0
+                            
+                            logger.debug(f"Result {i+1} - ID: {doc_id}, Distance: {distance:.4f}, Similarity: {similarity:.4f}")
+                            
+                            if similarity >= min_score:
+                                result = {
+                                    "content": doc_content,
+                                    "metadata": doc_metadata,
+                                    "score": similarity,
+                                    "id": doc_id
+                                }
+                                formatted_results.append(result)
+                                logger.debug(f"Added result with score: {similarity:.4f}")
+                            else:
+                                logger.debug(f"Skipped result with score below threshold: {similarity:.4f} < {min_score}")
+                                
+                        except Exception as e:
+                            logger.error(f"Error processing result {i}: {str(e)}", exc_info=True)
+                            continue
+                
+                # Sort by score and limit to k results
+                formatted_results.sort(key=lambda x: x['score'], reverse=True)
+                logger.info(f"Found {len(formatted_results)} results after filtering (min_score={min_score})")
+                
+                return formatted_results[:k]
+                
+            except Exception as e:
+                logger.error(f"Error querying collection: {str(e)}", exc_info=True)
+                return []
+            
+        except Exception as e:
+            logger.error(f"Unexpected error in _search_with_embedding: {str(e)}", exc_info=True)
+            return []
