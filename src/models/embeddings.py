@@ -41,11 +41,55 @@ class EmbeddingService:
     
     def _initialize_vector_store(self):
         """Initialize the vector store with the current embedding model"""
-        return Chroma(
-            collection_name="case_embeddings",
-            embedding_function=self.embeddings,
-            persist_directory=str(settings.embeddings_dir)
-        )
+        try:
+            # Ensure the directory exists with full permissions
+            persist_dir = Path(settings.embeddings_dir)
+            persist_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Set very permissive permissions
+            persist_dir.chmod(0o777)
+            
+            # Log directory permissions for debugging
+            import os
+            import stat
+            
+            def get_permissions(path):
+                st = os.stat(str(path))
+                return {
+                    'readable': os.access(str(path), os.R_OK),
+                    'writable': os.access(str(path), os.W_OK),
+                    'executable': os.access(str(path), os.X_OK),
+                    'mode': oct(stat.S_IMODE(st.st_mode)),
+                    'owner': st.st_uid,
+                    'group': st.st_gid
+                }
+            
+            logger.info(f"Vector store directory info: {persist_dir}")
+            logger.info(f"Directory permissions: {get_permissions(persist_dir)}")
+            
+            # Create the vector store with explicit permissions
+            vector_store = Chroma(
+                collection_name="case_embeddings",
+                embedding_function=self.embeddings,
+                persist_directory=str(persist_dir)
+            )
+            
+            # Verify we can write to the directory
+            test_file = persist_dir / ".test_write"
+            try:
+                with open(test_file, 'w') as f:
+                    f.write("test")
+                test_file.unlink()
+                logger.info("Successfully wrote test file to vector store directory")
+            except Exception as e:
+                logger.error(f"Failed to write test file to {persist_dir}: {str(e)}")
+                raise
+            
+            return vector_store
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize vector store: {str(e)}", exc_info=True)
+            raise
     
     def update_embedding_model(self, model_name: str, model_path: Optional[str] = None):
         """
@@ -181,36 +225,52 @@ class EmbeddingService:
     def add_case(self, case_data: Dict[str, Any]) -> bool:
         """
         Add a case to the vector store
-        
+
         Args:
             case_data: Dictionary containing case data
-            
+
         Returns:
-            True if successful, False otherwise
+            bool: True if successful, False otherwise
         """
         try:
             # Extract relevant fields
-            case_number = case_data.get('case_number')
-            if not case_number:
-                logger.error("Case number is required")
+            case_task_number = case_data.get('case_task_number')
+            if not case_task_number:
+                logger.error("Case task number is required")
                 return False
-                
-            # Prepare document
-            text = f"{case_data.get('subject', '')}\n\n{case_data.get('description', '')}"
+
+            # Prepare document text with all relevant information
+            text = (
+                f"Case Task: {case_task_number}\n"
+                f"Parent Case: {case_data.get('parent_case', 'N/A')}\n"
+                f"Tags: {case_data.get('case_task_tags', 'N/A')}\n"
+                f"Issue: {case_data.get('issue', '')}\n"
+                f"Root Cause: {case_data.get('root_cause', '')}\n"
+                f"Resolution: {case_data.get('resolution', '')}\n"
+                f"Support Steps: {case_data.get('steps_support', '')}"
+            )
+
+            # Include all fields in metadata
             metadata = {
-                'case_number': case_number,
-                'subject': case_data.get('subject', ''),
-                'created_at': datetime.utcnow().isoformat()
+                'case_task_number': case_task_number,
+                'parent_case': case_data.get('parent_case', ''),
+                'case_task_tags': case_data.get('case_task_tags', ''),
+                'issue': case_data.get('issue', ''),
+                'root_cause': case_data.get('root_cause', ''),
+                'resolution': case_data.get('resolution', ''),
+                'steps_support': case_data.get('steps_support', ''),
+                'created_at': case_data.get('created_at', datetime.utcnow().isoformat()),
+                'updated_at': case_data.get('updated_at', datetime.utcnow().isoformat())
             }
-            
+
             # Add to vector store
             self.vector_store.add_documents([Document(page_content=text, metadata=metadata)])
-            
+
             # Persist changes
             self.vector_store.persist()
-            
+
             return True
-            
+
         except Exception as e:
             logger.error(f"Error adding case to vector store: {str(e)}")
             return False

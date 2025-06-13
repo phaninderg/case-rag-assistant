@@ -8,6 +8,8 @@ import json
 import uuid
 from datetime import datetime
 from pathlib import Path
+import pandas as pd
+import io
 
 # Update imports to use absolute paths
 from src.config.settings import settings
@@ -45,14 +47,24 @@ case_service.llm_service = llm_service  # Set up circular dependency if needed
 training_service = TrainingService()
 
 # Request/Response Models
+# In src/app.py
 class CaseCreate(BaseModel):
-    subject: str = Field(..., min_length=3, max_length=200)
-    description: str = Field(..., min_length=10)
-    case_number: str = Field(..., min_length=1, max_length=50)
-    parent_case: Optional[str] = None
-    close_notes: Optional[str] = None
-    tags: List[str] = Field(default_factory=list)
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+    """
+    Model for creating a new case with the following fields from case_task.csv:
+    - case_task_number: Unique identifier for the case task
+    - parent_case: Reference to a parent case (optional)
+    - issue: Description of the issue
+    - root_cause: Analysis of the root cause
+    - resolution: Steps to resolve the issue
+    - steps_support: Detailed support steps taken
+    """
+    case_task_number: str = Field(..., min_length=1, max_length=50, description="Unique identifier for the case task")
+    parent_case: Optional[str] = Field(None, description="Reference to a parent case (optional)")
+    issue: str = Field(..., min_length=3, description="Description of the issue")
+    root_cause: str = Field(..., description="Analysis of the root cause")
+    resolution: str = Field(..., description="Steps to resolve the issue")
+    steps_support: str = Field(..., description="Detailed support steps taken")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
 
 class CaseResponse(CaseCreate):
     created_at: str
@@ -85,9 +97,19 @@ class CaseSummaryRequest(BaseModel):
     model_path: Optional[str] = None
 
 class TrainModelRequest(BaseModel):
-    cases: Optional[List[Dict[str, Any]]] = None
-    cases_file: Optional[UploadFile] = None
+    """
+    Request model for training a new model.
+    
+    The CSV file should contain the following columns:
+    - issue: Description of the issue
+    - root_cause: Analysis of the root cause
+    - resolution: Steps to resolve the issue
+    - steps_support: Detailed support steps taken
+    """
+    cases_file: UploadFile = File(..., description="CSV file containing case tasks with columns: issue, root_cause, resolution, steps_support")
     output_dir: str = "./trained_models/case_model"
+    epochs: int = 3
+    learning_rate: float = 2e-5
 
 class LLMConfigUpdate(BaseModel):
     model_name: Optional[str] = None
@@ -106,12 +128,12 @@ async def create_case(case_data: CaseCreate):
     """Create a new case."""
     try:
         case = case_service.create_case(
-            subject=case_data.subject,
-            description=case_data.description,
-            case_number=case_data.case_number,
+            case_task_number=case_data.case_task_number,
             parent_case=case_data.parent_case,
-            close_notes=case_data.close_notes,
-            tags=case_data.tags,
+            issue=case_data.issue,
+            root_cause=case_data.root_cause,
+            resolution=case_data.resolution,
+            steps_support=case_data.steps_support,
             **case_data.metadata
         )
         return case
@@ -308,60 +330,37 @@ async def train_model(
     request: TrainModelRequest
 ):
     """
-    Train a model on case data with instruction fine-tuning.
+    Train a model on case task data with instruction fine-tuning.
     
     Args:
-        cases: List of case dictionaries containing training data
-        cases_file: JSON file containing cases (alternative to cases parameter)
+        cases_file: CSV file containing case tasks
         output_dir: Directory to save the trained model
+        epochs: Number of training epochs
+        learning_rate: Learning rate for training
     """
     try:
-        training_data = request.cases
+        # Read and parse CSV file
+        contents = await request.cases_file.read()
+        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
         
-        # If no cases provided directly, check for file upload
-        if not training_data and request.cases_file:
-            try:
-                content = await request.cases_file.read()
-                data = json.loads(content)
-                # Handle both direct cases array and metadata wrapper format
-                training_data = data.get('cases', data) if isinstance(data, dict) else data
-            except json.JSONDecodeError:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid JSON file"
-                )
-        
-        if not training_data:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No training data provided. Either 'cases' or 'cases_file' must be provided."
-            )
-        
-        # Ensure output directory exists
-        output_dir = Path(request.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # Convert DataFrame to list of dictionaries
+        cases = df.to_dict('records')
         
         # Train the model
-        result = training_service.train_model(training_data, str(output_dir))
-        
-        if result["status"] != "success":
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=result.get("message", "Training failed")
-            )
-            
-        return JSONResponse(
-            content={
-                "status": "success",
-                "message": "Model training completed successfully",
-                "model_path": result["model_path"],
-                "training_samples": len(training_data)
-            },
-            status_code=status.HTTP_200_OK
+        output_path = training_service.train(
+            cases=cases,
+            output_dir=request.output_dir,
+            num_train_epochs=request.epochs,
+            learning_rate=request.learning_rate
         )
         
-    except HTTPException:
-        raise
+        return {
+            "status": "success",
+            "message": "Model trained successfully",
+            "model_path": output_path,
+            "training_samples": len(cases)
+        }
+        
     except Exception as e:
         logger.error(f"Training failed: {str(e)}", exc_info=True)
         raise HTTPException(
@@ -408,7 +407,7 @@ async def load_trained_model(
 
 @app.post("/api/train", status_code=200)
 async def train_model(
-    cases_file: UploadFile = File(...),
+    cases_file: UploadFile = File(..., description="CSV file containing case tasks"),
     output_dir: str = Form("./trained_models/case_model"),
     epochs: int = Form(3),
     learning_rate: float = Form(2e-5)
@@ -417,7 +416,7 @@ async def train_model(
     Train a new model on the provided cases.
     
     Args:
-        cases_file: JSON file containing cases (required)
+        cases_file: CSV file containing case tasks
         output_dir: Directory to save the trained model
         epochs: Number of training epochs
         learning_rate: Learning rate for training
@@ -426,36 +425,28 @@ async def train_model(
         dict: Status and path to the trained model
     """
     try:
-        # Read and parse the uploaded file
-        content = await cases_file.read()
-        try:
-            data = json.loads(content)
-            # Handle both direct cases array and metadata wrapper format
-            training_data = data.get('cases', data) if isinstance(data, dict) else data
-            if not isinstance(training_data, list):
-                raise ValueError("Invalid file format: expected a JSON array or object with 'cases' key")
-        except json.JSONDecodeError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid JSON file"
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid training data format: {str(e)}"
-            )
-            
+        # Read and parse CSV file
+        contents = await cases_file.read()
+        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
+        
+        # Convert DataFrame to list of dictionaries
+        cases = df.to_dict('records')
+        
         # Train the model
-        output_dir = training_service.train(
-            cases=training_data,
+        output_path = training_service.train(
+            cases=cases,
             output_dir=output_dir,
             num_train_epochs=epochs,
             learning_rate=learning_rate
         )
-        return {"status": "success", "model_path": output_dir}
         
-    except HTTPException:
-        raise
+        return {
+            "status": "success",
+            "message": "Model trained successfully",
+            "model_path": output_path,
+            "training_samples": len(cases)
+        }
+        
     except Exception as e:
         logger.error(f"Training failed: {str(e)}", exc_info=True)
         raise HTTPException(

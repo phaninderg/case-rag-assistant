@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union, AsyncGenerator
 import re
+import uuid
 
 from langchain.docstore.document import Document
 
@@ -14,122 +15,145 @@ from src.utils.helpers import generate_id, format_timestamp
 
 logger = logging.getLogger(__name__)
 
+# In src/services/case_service.py
+from typing import Dict, List, Optional, Any
+from datetime import datetime
+import json
+import logging
+from langchain.docstore.document import Document
+from src.models.embeddings import EmbeddingService
+from src.services.llm_service import LLMService
+
+logger = logging.getLogger(__name__)
+
 class CaseService:
-    # Maximum length for description in characters (adjust as needed)
-    MAX_DESCRIPTION_LENGTH = 100000  # Increased from default
-    
+    # Maximum length for description in characters
+    MAX_DESCRIPTION_LENGTH = 100000
+
     def __init__(self, llm_service: Optional[LLMService] = None):
         self.llm_service = llm_service
         self.embedding_service = EmbeddingService()
-    
+
     def _prepare_case_document(self, case_data: Dict[str, Any]) -> Document:
-        """Prepare a case document for storage in the vector database."""
-        # Get and clean the description
-        description = case_data.get('description', '')
-        # Replace all newlines with spaces and clean up whitespace
-        description = description.replace('\n', ' ').replace('\r', ' ')
-        description = ' '.join(description.split())
+        """
+        Prepare a case document for storage in the vector database.
         
-        # Truncate if it exceeds max length
-        if len(description) > self.MAX_DESCRIPTION_LENGTH:
-            description = description[:self.MAX_DESCRIPTION_LENGTH]
-            logger.warning(f"Description truncated to {self.MAX_DESCRIPTION_LENGTH} characters")
+        This method creates a searchable document with all relevant case information
+        and ensures all fields are properly indexed for retrieval.
         
-        # Clean close_notes as well
-        close_notes = None
-        if 'close_notes' in case_data and case_data['close_notes']:
-            close_notes = case_data['close_notes'].replace('\n', ' ').replace('\r', ' ').strip()
+        Args:
+            case_data: Dictionary containing case data
+            
+        Returns:
+            Document: A document ready for storage in the vector database
+        """
+        # Extract and clean all fields
+        case_task_number = case_data.get('case_task_number', '')
+        parent_case = case_data.get('parent_case', '')
+        issue = case_data.get('issue', '')
+        root_cause = case_data.get('root_cause', '')
+        resolution = case_data.get('resolution', '')
+        steps_support = case_data.get('steps_support', '')
+        created_at = case_data.get('created_at', datetime.utcnow().isoformat())
+        updated_at = case_data.get('updated_at', created_at)
         
-        # Store the full description in metadata for reliable retrieval
+        # Clean text fields (remove extra whitespace, newlines, etc.)
+        clean_text = lambda x: ' '.join(str(x).split()) if x else ''
+        
+        # Create metadata with all fields for filtering and retrieval
         metadata = {
-            "case_number": case_data["case_number"],
-            "subject": case_data.get("subject", ""),
-            "description": description,  # Store full description in metadata
-            "created_at": case_data.get("created_at") or datetime.utcnow().isoformat(),
-            "updated_at": case_data.get("updated_at") or datetime.utcnow().isoformat(),
-            "tags": json.dumps(case_data.get("tags", [])),
-            "description_length": len(description),
+            "case_task_number": clean_text(case_task_number),
+            "parent_case": clean_text(parent_case) if parent_case else None,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "source": "case_management_system"
         }
         
-        # Add close_notes to metadata if it exists
-        if close_notes:
-            metadata["close_notes"] = close_notes
-        
-        # Only add parent_case if it exists and is a non-empty string
-        parent_case = case_data.get("parent_case")
-        if parent_case and isinstance(parent_case, str) and parent_case.strip():
-            metadata["parent_case"] = parent_case.strip()
-        
-        # Create searchable text from all relevant fields
+        # Create searchable text with all relevant information
         search_text = (
-            f"SUBJECT: {case_data.get('subject', '')}\n"
-            f"DESCRIPTION: {description}\n"
-            f"CASE_NUMBER: {case_data.get('case_number', '')}\n"
-            f"TAGS: {', '.join(case_data.get('tags', []))}"
+            f"CASE_TASK_NUMBER: {clean_text(case_task_number)}\n"
+            f"PARENT_CASE: {clean_text(parent_case)}\n"
+            f"ISSUE: {clean_text(issue)}\n"
+            f"ROOT_CAUSE: {clean_text(root_cause)}\n"
+            f"RESOLUTION: {clean_text(resolution)}\n"
+            f"STEPS_SUPPORT: {clean_text(steps_support)}"
         )
         
-        # Add close notes if they exist
-        if close_notes:
-            search_text += f"\nCLOSE_NOTES: {close_notes}"
+        # Add additional fields to metadata for filtering
+        metadata.update({
+            "has_parent": bool(parent_case),
+            "text_length": len(search_text),
+            "has_resolution": bool(resolution.strip()),
+            "has_steps": bool(steps_support.strip())
+        })
+        
+        # Add any additional metadata from the case_data
+        if 'metadata' in case_data and isinstance(case_data['metadata'], dict):
+            for k, v in case_data['metadata'].items():
+                if v is not None and k not in metadata:
+                    metadata[k] = str(v)
         
         # Filter out None values from metadata
         metadata = {k: v for k, v in metadata.items() if v is not None}
         
         return Document(page_content=search_text, metadata=metadata)
-    
+
     def create_case(
-        self, 
-        subject: str,
-        description: str,
-        case_number: str,
+        self,
+        case_task_number: str,
+        issue: str,
+        root_cause: str,
+        resolution: str,
+        steps_support: str,
         parent_case: Optional[str] = None,
-        close_notes: Optional[str] = None,
-        tags: Optional[List[str]] = None,
         **metadata
     ) -> Dict[str, Any]:
         """
         Create a new case and store it in the vector database.
-        
+
         Args:
-            subject: Case subject/short description
-            description: Detailed description of the case
-            case_number: Case number (required, used as primary key)
-            parent_case: Optional parent case reference
-            close_notes: Optional close notes
-            tags: Optional list of tags
+            case_task_number: Unique identifier for the case task
+            issue: Description of the issue
+            root_cause: Analysis of the root cause
+            resolution: Steps to resolve the issue
+            steps_support: Detailed support steps taken
+            parent_case: Optional reference to a parent case
             **metadata: Additional metadata fields
-            
+
         Returns:
             Dictionary containing the created case data
-            
-        Raises:
-            ValueError: If required fields are missing or case already exists
         """
         # Validate required fields
-        if not case_number or not isinstance(case_number, str) or not case_number.strip():
-            raise ValueError("A valid case_number is required")
+        if not case_task_number or not isinstance(case_task_number, str) or not case_task_number.strip():
+            raise ValueError("A valid case task number is required")
             
-        if not subject or not isinstance(subject, str) or not subject.strip():
-            raise ValueError("A valid subject is required")
+        if not issue or not isinstance(issue, str) or not issue.strip():
+            raise ValueError("A valid issue description is required")
             
-        if not description or not isinstance(description, str) or not description.strip():
-            raise ValueError("A valid description is required")
+        if not root_cause or not isinstance(root_cause, str) or not root_cause.strip():
+            raise ValueError("Root cause analysis is required")
+            
+        if not resolution or not isinstance(resolution, str) or not resolution.strip():
+            raise ValueError("Resolution steps are required")
+            
+        if not steps_support or not isinstance(steps_support, str) or not steps_support.strip():
+            raise ValueError("Support steps are required")
+        
+        # Check if case with this number already exists
+        existing_case = self.get_case_by_task_number(case_task_number)
+        if existing_case:
+            raise ValueError(f"Case with task number {case_task_number} already exists")
         
         created_at = datetime.utcnow().isoformat()
         
-        # Check if case with this number already exists
-        existing_case = self.get_case(case_number)
-        if existing_case:
-            raise ValueError(f"Case with number {case_number} already exists")
-        
         # Prepare the case data
         case_data = {
-            "case_number": case_number.strip(),
-            "subject": subject.strip(),
-            "description": description.strip(),
+            "case_task_number": case_task_number.strip(),
             "parent_case": parent_case.strip() if parent_case and isinstance(parent_case, str) else None,
-            "close_notes": close_notes.strip() if close_notes and isinstance(close_notes, str) else None,
-            "tags": [tag.strip() for tag in tags if isinstance(tag, str) and tag.strip()] if tags else [],
+            "issue": issue.strip(),
+            "root_cause": root_cause.strip(),
+            "resolution": resolution.strip(),
+            "steps_support": steps_support.strip(),
             "created_at": created_at,
             "updated_at": created_at,
             **{k: v for k, v in metadata.items() if v is not None}
@@ -137,28 +161,27 @@ class CaseService:
         
         # Create and store document in vector database
         doc = self._prepare_case_document(case_data)
-        self.embedding_service.add_document(case_number, doc.page_content, doc.metadata)
+        self.embedding_service.add_document(case_task_number, doc.page_content, doc.metadata)
         
         return case_data
-    
-    def get_case(self, case_number: str) -> Optional[Dict[str, Any]]:
+
+    def get_case_by_task_number(self, case_task_number: str) -> Optional[Dict[str, Any]]:
         """
-        Retrieve a case by its case number from the vector database.
+        Retrieve a case by its task number.
         
         Args:
-            case_number: The case number to retrieve
+            case_task_number: The case task number to look up
             
         Returns:
             The case data if found, None otherwise
         """
-        if not case_number:
+        if not case_task_number:
             return None
             
         try:
-            # Search for the case by case_number in the metadata
             results = self.embedding_service.vector_store.similarity_search(
                 "",
-                filter={"case_number": case_number},
+                filter={"case_task_number": case_task_number},
                 k=1
             )
             
@@ -168,218 +191,151 @@ class CaseService:
             doc = results[0]
             metadata = doc.metadata
             
-            # Get description directly from metadata where it's stored in full
-            description = metadata.get("description", "")
-            
             return {
-                "case_number": metadata.get("case_number", ""),
-                "subject": metadata.get("subject", ""),
-                "description": description,
+                "case_task_number": metadata.get("case_task_number", ""),
                 "parent_case": metadata.get("parent_case"),
-                "close_notes": metadata.get("close_notes"),
+                "issue": metadata.get("issue", ""),
+                "root_cause": metadata.get("root_cause", ""),
+                "resolution": metadata.get("resolution", ""),
+                "steps_support": metadata.get("steps_support", ""),
                 "created_at": metadata.get("created_at", ""),
-                "updated_at": metadata.get("updated_at", ""),
-                "tags": json.loads(metadata.get("tags", "[]")),
+                "updated_at": metadata.get("updated_at", "")
             }
             
         except Exception as e:
-            logger.error(f"Error retrieving case {case_number}: {str(e)}", exc_info=True)
+            logger.error(f"Error retrieving case by task number {case_task_number}: {str(e)}", exc_info=True)
             return None
 
-    async def search_cases(
-        self, 
-        query: str, 
-        k: int = 5, 
-        include_details: bool = False,
-        model_name: Optional[str] = None,
-        model_path: Optional[str] = None
-    ) -> Union[List[Dict[str, Any]], str]:
+    def get_case(self, case_task_number: str) -> Optional[Dict[str, Any]]:
         """
-        Search for cases similar to the query.
-        
+        Retrieve a case by its case task number from the vector database.
+
         Args:
-            query: Search query string
-            k: Number of results to return
-            include_details: Whether to include detailed LLM analysis
-            model_name: Optional model name to use for search
-            model_path: Optional path to a local model
+            case_task_number: The case task number to retrieve
             
         Returns:
-            List of matching cases or formatted string with analysis
+            The case data if found, None otherwise
         """
+        if not case_task_number:
+            return None
+            
         try:
-            # Load the specified model if different from current
-            if model_name or model_path:
-                self.llm_service.load_model(
-                    model_name=model_name or "default",
-                    model_path=model_path
-                )
+            # Search for the case by case_task_number in the metadata
+            results = self.embedding_service.vector_store.similarity_search(
+                "",
+                filter={"case_task_number": case_task_number.strip()},
+                k=1
+            )
+            
+            if not results:
+                return None
                 
-            # Generate query embedding
-            query_embedding = self.llm_service.get_embedding(query)
+            doc = results[0]
+            metadata = doc.metadata
             
-            # Find similar cases
-            results = self.embedding_service.similarity_search(
-                query_embedding=query_embedding,
-                k=k
-            )
+            # Parse the page content to extract the fields
+            content = doc.page_content
+            fields = {}
+            for line in content.split('\n'):
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    fields[key.strip().lower()] = value.strip()
             
-            if not include_details:
-                return results
+            # Merge metadata with parsed fields, giving priority to metadata
+            result = {
+                "case_task_number": metadata.get("case_task_number", fields.get("case_task_number", "")),
+                "parent_case": metadata.get("parent_case", fields.get("parent_case")),
+                "issue": metadata.get("issue", fields.get("issue", "")),
+                "root_cause": metadata.get("root_cause", fields.get("root_cause", "")),
+                "resolution": metadata.get("resolution", fields.get("resolution", "")),
+                "steps_support": metadata.get("steps_support", fields.get("steps_support", "")),
+                "created_at": metadata.get("created_at", ""),
+                "updated_at": metadata.get("updated_at", ""),
+            }
+            
+            # Add any additional metadata fields
+            for key, value in metadata.items():
+                if key not in result:
+                    result[key] = value
+                    
+            return result
                 
-            # Generate detailed analysis using LLM
-            context = "\n".join(
-                f"Case {i+1}:\n"
-                f"Subject: {res['subject']}\n"
-                f"Description: {res['description']}\n"
-                f"Relevance Score: {res['score']:.4f}\n"
-                for i, res in enumerate(results)
-            )
-            
-            prompt = (
-                f"Analyze these search results for the query: '{query}'\n\n"
-                f"{context}\n\n"
-                "Provide a concise analysis of the most relevant cases "
-                "and their potential solutions."
-            )
-            
-            analysis = await self.llm_service.generate_response(prompt)
-            return analysis
-            
         except Exception as e:
-            logger.error(f"Error in case search: {str(e)}", exc_info=True)
-            raise
+            logger.error(f"Error retrieving case {case_task_number}: {str(e)}", exc_info=True)
+            return None
 
     async def generate_case_summary(
         self,
-        case_number: str,
+        case_task_number: str,
         model_name: Optional[str] = None,
         model_path: Optional[str] = None
     ) -> str:
         """
-        Generate a concise summary of a case's description.
+        Generate a summary of a case using the LLM.
         
         Args:
-            case_number: The case number to summarize
+            case_task_number: The case task number to summarize
             model_name: Optional model name to use
             model_path: Optional path to a local model
             
         Returns:
-            str: A 4-5 sentence summary of the core problem
+            str: A 4-5 sentence summary of the case
         """
+        if not self.llm_service:
+            return "LLM service not available for summarization."
+            
         try:
-            # Get the case details
-            case = self.get_case(case_number)
+            # Get the case data
+            case = self.get_case_by_task_number(case_task_number)
             if not case:
-                raise ValueError(f"Case with number {case_number} not found")
+                return f"Case {case_task_number} not found."
                 
-            subject = case.get('subject', '').strip()
-            description = case.get('description', '').strip()
+            # Extract the relevant fields
+            issue = case.get('issue', '')
+            if not issue:
+                return f"No issue description available for case {case_task_number}."
+                
+            root_cause = case.get('root_cause', '')
+            resolution = case.get('resolution', '')
             
-            if not description:
-                return f"No description available for case {case_number}."
-            
-            # Extract the main issue from the description
-            issue_section = ""
-            issue_markers = [
-                "Issue Definition:",
-                "Problem Description:",
-                "Issue:",
-                "Problem:",
-                "Description:"
-            ]
-            
-            for marker in issue_markers:
-                if marker in description:
-                    # Get text after the marker
-                    issue_text = description.split(marker, 1)[1]
-                    # Take text until the next section or end
-                    issue_text = re.split(r'\n[A-Z][a-z]+:', issue_text)[0]
-                    issue_section = issue_text.strip()
-                    break
-            
-            # If no specific issue section found, use the beginning of the description
-            if not issue_section:
-                issue_section = ' '.join(description.split('\n')[:10])
-            
-            # Clean up the text
-            issue_section = re.sub(r'<<[^>]*>>', '', issue_section)  # Remove template markers
-            issue_section = re.sub(r'https?://\S+', '', issue_section)  # Remove URLs
-            issue_section = ' '.join(issue_section.split())  # Normalize whitespace
-            
-            if not issue_section:
-                return f"Unable to extract issue details from case {case_number}."
-            
-            # Prepare a focused prompt with clear instructions
-            prompt = (
-                "Provide a 4-5 sentence summary of the following issue. "
-                "Focus on the core problem and its impact. Be specific and technical.\n\n"
-                f"Subject: {subject}\n\n"
-                f"Details: {issue_section[:1500]}"
+            # Generate the summary using the LLM service
+            summary = await self.llm_service.summarize_case(
+                issue=issue,
+                root_cause=root_cause,
+                resolution=resolution
             )
             
-            # Generate the summary
-            response = await self.llm_service.generate_response(
-                prompt=prompt,
-                max_length=500,
-                temperature=0.3,
-                top_p=0.9,
-                do_sample=False,
-                max_new_tokens=300
-            )
-            
-            # Clean up the response
-            summary = response.strip()
-            
-            # Remove any instance of the prompt in the response
-            summary = summary.replace(prompt, '').strip()
-            
-            # Remove any remaining quotes and extra whitespace
-            summary = re.sub(r'^["\']|["\']$', '', summary)
-            summary = re.sub(r'\s+', ' ', summary).strip()
-            
-            # If the summary still looks like it contains the prompt, try to extract just the summary part
-            if 'Subject:' in summary and 'Details:' in summary:
-                summary = summary.split('Details:')[-1].strip()
-            
-            # Ensure we have a valid summary
-            if not summary or len(summary.split()) < 10:
-                # Fallback: return a simple summary based on the subject and first part of the issue
-                return (
-                    f"Issue with {subject}. "
-                    f"{issue_section[:300]}"
-                )
-                
-            return summary
+            return summary.strip()
             
         except Exception as e:
             logger.error(f"Error generating case summary: {str(e)}", exc_info=True)
             return f"Error generating summary: {str(e)}"
 
-    async def get_related_cases(self, case_number: str, k: int = 3) -> List[Dict[str, Any]]:
+    async def get_related_cases(self, case_task_number: str, k: int = 3) -> List[Dict[str, Any]]:
         """
         Find cases related to the given case using LLM.
         
         Args:
-            case_number: The reference case number
+            case_task_number: The reference case task number
             k: Maximum number of related cases to return (1-10)
             
         Returns:
-            List of dictionaries containing case_number, subject, and relevance_score
+            List of dictionaries containing case_task_number, issue, and relevance_score
             
         Raises:
             ValueError: If the case is not found or LLM service is not available
         """
         # Get the reference case
-        case = self.get_case(case_number)
+        case = self.get_case(case_task_number)
         if not case:
-            raise ValueError(f"Case {case_number} not found")
+            raise ValueError(f"Case {case_task_number} not found")
             
         # Create a search query based on the case details
         search_query = f"""
         Find cases related to:
-        Subject: {case['subject']}
-        Description: {case['description'][:500]}...
+        Issue: {case['issue']}
+        Root Cause: {case['root_cause']}
+        Resolution: {case['resolution'][:500]}...
         """
         
         # Use the search_cases method with the generated query
@@ -388,7 +344,7 @@ class CaseService:
         # Filter out the reference case itself and limit to k results
         return [
             c for c in related_cases 
-            if c['case_number'] != case_number
+            if c['case_task_number'] != case_task_number
         ][:k]
 
     async def find_similar_cases(

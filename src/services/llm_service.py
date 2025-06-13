@@ -134,22 +134,25 @@ class LLMService:
             logger.error(f"Error generating response: {str(e)}", exc_info=True)
             raise
 
-    async def summarize_case(self, subject: str, description: str) -> str:
+    async def summarize_case(self, issue: str, root_cause: str, resolution: str = '') -> str:
         """
         Generate a summary for a support case.
         
         Args:
-            subject: Case subject
-            description: Case description
+            issue: The main issue description
+            root_cause: Analysis of the root cause
+            resolution: Resolution steps (optional)
             
         Returns:
             str: Generated summary
         """
         prompt = (
             "### Instruction: Summarize this support case in 3-5 sentences "
-            "focusing on the core issue.\n\n"
-            f"### Input:\nSubject: {subject}\nDescription: {description}\n\n"
-            "### Response:"
+            "focusing on the core issue and resolution.\n\n"
+            f"### Issue:\n{issue}\n\n"
+            f"### Root Cause:\n{root_cause}\n\n"
+            f"### Resolution:\n{resolution if resolution else 'No resolution provided'}\n\n"
+            "### Summary:"
         )
         return await self.generate_response(prompt, max_length=300)
 
@@ -216,24 +219,72 @@ class LLMService:
                     if not include_solutions:
                         solution_text = content[:500]  # Return first 500 chars if no solution needed
                     else:
-                        try:
-                            # Extract key information from the case
-                            subject = metadata.get('subject', 'No subject')
-                            close_notes = metadata.get('close_notes', '').strip()
+                        # Extract key information from the case
+                        case_number = metadata.get('case_task_number', 'N/A')
+                        parent_case = metadata.get('parent_case', '')
+                        case_task_tags = metadata.get('case_task_tags', '')
+                        
+                        # Try to get fields from metadata first, then parse from content if not found
+                        issue = metadata.get('issue', '')
+                        root_cause = metadata.get('root_cause', '')
+                        resolution = metadata.get('resolution', '').strip()
+                        steps_support = metadata.get('steps_support', '').strip()
+                        
+                        # If any field is missing, try to parse from page content
+                        if not all([issue, root_cause, resolution, steps_support]) and content:
+                            content_lower = content.lower()
+                            lines = content.split('\n')
                             
-                            # Check if close_notes exist
-                            if not close_notes:
-                                solution_text = "No close_notes found for this case, cannot propose a solution."
-                            else:
-                                # Use close_notes as the basis for the solution
+                            # Parse fields from content
+                            content_fields = {}
+                            current_field = None
+                            
+                            for line in lines:
+                                line_lower = line.lower()
+                                if 'issue:' in line_lower:
+                                    current_field = 'issue'
+                                    content_fields[current_field] = line.split(':', 1)[1].strip() if ':' in line else ''
+                                elif 'root_cause:' in line_lower or 'root cause:' in line_lower:
+                                    current_field = 'root_cause'
+                                    content_fields[current_field] = line.split(':', 1)[1].strip() if ':' in line else ''
+                                elif 'resolution:' in line_lower:
+                                    current_field = 'resolution'
+                                    content_fields[current_field] = line.split(':', 1)[1].strip() if ':' in line else ''
+                                elif 'steps_support:' in line_lower or 'steps support:' in line_lower:
+                                    current_field = 'steps_support'
+                                    content_fields[current_field] = line.split(':', 1)[1].strip() if ':' in line else ''
+                                elif current_field and line.strip():
+                                    # Append to current field if we're in a multi-line value
+                                    content_fields[current_field] += '\n' + line.strip()
+                            
+                            # Update fields from content if they were missing from metadata
+                            issue = issue or content_fields.get('issue', '')
+                            root_cause = root_cause or content_fields.get('root_cause', '')
+                            resolution = resolution or content_fields.get('resolution', '').strip()
+                            steps_support = steps_support or content_fields.get('steps_support', '').strip()
+                        
+                        # Check if we have resolution or steps_support to generate a solution
+                        if not resolution and not steps_support:
+                            solution_text = "No resolution or support steps found for this case, cannot propose a solution."
+                        else:
+                            try:
+                                # Use resolution and steps_support as the basis for the solution
                                 prompt = (
-                                    "### Support Case Summary ###\n"
-                                    f"Subject: {subject}\n\n"
-                                    "### Close Notes ###\n"
-                                    f"{close_notes}\n\n"
+                                    "### Case Information ###\n"
+                                    f"Case Number: {case_number}\n"
+                                    f"Parent Case: {parent_case if parent_case else 'None'}\n"
+                                    f"Tags: {case_task_tags if case_task_tags else 'None'}\n\n"
+                                    "### Issue Description ###\n"
+                                    f"{issue if issue else 'No issue description'}\n\n"
+                                    "### Root Cause ###\n"
+                                    f"{root_cause if root_cause else 'No root cause provided'}\n\n"
+                                    "### Resolution Details ###\n"
+                                    f"{resolution if resolution else 'No resolution details provided'}\n\n"
+                                    "### Support Steps ###\n"
+                                    f"{steps_support if steps_support else 'No support steps provided'}\n\n"
                                     "### Your Task ###\n"
-                                    "Based on the above case close notes, summarize the solution that was implemented.\n"
-                                    "Focus on the key resolution steps and final outcome.\n\n"
+                                    "Based on the above case details, provide a clear and concise solution summary. "
+                                    "Focus on the key resolution steps and final outcome. If resolution is missing, use the support steps.\n\n"
                                     "### Solution Summary ###\n"
                                 )
                                 
@@ -256,17 +307,17 @@ class LLMService:
                                 
                                 # Ensure we have a valid solution
                                 if not solution_text or solution_text.isspace() or len(solution_text) < 10:
-                                    solution_text = "No detailed solution could be generated from the close notes."
-                        
-                        except Exception as e:
-                            logger.error(f"Error generating solution: {str(e)}", exc_info=True)
-                            solution_text = "Error generating solution from close notes."
+                                    solution_text = "No detailed solution could be generated from the resolution."
+                                
+                            except Exception as e:
+                                logger.error(f"Error generating solution: {str(e)}", exc_info=True)
+                                solution_text = "Error generating solution from resolution."
                     
                     # Add to results
                     solutions.append({
                         'solution': solution_text,
                         'similarity_score': score,
-                        'case_number': metadata.get('case_number', 'N/A')
+                        'case_number': metadata.get('case_task_number', 'N/A')
                     })
                     
                 except Exception as e:
@@ -281,7 +332,7 @@ class LLMService:
         except Exception as e:
             logger.error(f"Error in search_similar_cases: {str(e)}", exc_info=True)
             raise
-    
+
     def get_embedding(self, text: str) -> List[float]:
         """
         Generate an embedding for the given text.
