@@ -17,17 +17,17 @@ logger = logging.getLogger(__name__)
 class LLMService:
     """Service for handling LLM interactions with support for multiple providers."""
     
-    def __init__(self, model_path: str = None, model_name: str = "google/gemma-2b-it", case_service: 'CaseService' = None):
+    def __init__(self, model_path: str = None, model_name: str = None, case_service: 'CaseService' = None):
         """
         Initialize the LLM service.
         
         Args:
             model_path: Path to a fine-tuned model
-            model_name: Name of the base model to use if no path is provided (defaults to Gemma 2B)
+            model_name: Name of the base model to use if no path is provided (defaults to settings.default_llm)
             case_service: Instance of CaseService for vector search
         """
         self.model_path = model_path
-        self.model_name = model_name
+        self.model_name = model_name or settings.default_llm
         self.case_service = case_service
         self.device = self._get_device()
         logger.info(f"Using device: {self.device}")
@@ -37,8 +37,11 @@ class LLMService:
         # Configure environment for Apple Silicon
         os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
         
-        # Load model
-        self.load_model(model_path or model_name)
+        # Log the model being loaded for debugging
+        model_to_load = self.model_path or self.model_name
+        
+        # Load model using the instance variable which has the correct default from settings
+        self.load_model(model_to_load)
         
         # Setup Hugging Face authentication
         self._setup_huggingface_auth()
@@ -81,6 +84,14 @@ class LLMService:
         self._log_memory_usage("Before loading model: ")
         
         try:
+            # Get model configuration
+            from src.config.models import get_model_config, ModelType
+            model_config = get_model_config(model_identifier, ModelType.CHAT)
+            
+            # Use model_id from config which includes the full path
+            model_id = model_config.model_id
+            logger.info(f"Using model ID from config: {model_id}")
+            
             # Check for Apple Silicon MPS
             mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
             
@@ -110,7 +121,7 @@ class LLMService:
             
             # Configure tokenizer with proper padding
             self.tokenizer = AutoTokenizer.from_pretrained(
-                model_identifier,
+                model_id,  # Use model_id from config
                 padding_side="left",
                 trust_remote_code=True
             )
@@ -145,7 +156,7 @@ class LLMService:
             # Load the model with progress tracking
             logger.info("Loading model, this may take a few minutes...")
             self.model = AutoModelForCausalLM.from_pretrained(
-                model_identifier,
+                model_id,
                 **model_kwargs
             )
             

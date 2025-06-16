@@ -60,8 +60,8 @@ DEFAULT_EMBEDDING_MODELS = {
 }
 
 DEFAULT_LLM_MODELS = {
-    "llama3-8b": LLMConfig(
-        name="llama3-8b",
+    "llama3.1-8b": LLMConfig(
+        name="llama3.1-8b",
         provider=ModelProvider.HUGGINGFACE,
         model_id="meta-llama/Llama-3.1-8B",
         context_length=8192,
@@ -111,15 +111,32 @@ DEFAULT_LLM_MODELS = {
             "trust_remote_code": True,
             "low_cpu_mem_usage": True
         }
+    ),
+    "google/gemma-2b-it": LLMConfig(
+        name="gemma-2b-it",
+        provider=ModelProvider.HUGGINGFACE,
+        model_id="google/gemma-2b-it",
+        context_length=8192,
+        max_new_tokens=1024,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=50,
+        repetition_penalty=1.1,
+        model_kwargs={
+            "device_map": "auto",
+            "torch_dtype": torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            "trust_remote_code": True,
+            "low_cpu_mem_usage": True
+        }
     )
 }
 
 # Set default models
-DEFAULT_LLM = "llama3-8b"
+DEFAULT_LLM = "google/gemma-2b-it"
 DEFAULT_EMBEDDING = "all-mpnet-base-v2"
 
 def get_model_config(model_name: str, model_type: ModelType) -> ModelConfig:
     """Get model configuration by name and type."""
     if model_type == ModelType.EMBEDDING:
         return DEFAULT_EMBEDDING_MODELS.get(model_name, DEFAULT_EMBEDDING_MODELS["all-mpnet-base-v2"])
-    return DEFAULT_LLM_MODELS.get(model_name, DEFAULT_LLM_MODELS["llama3-8b"])  # Default to llama3-8b
+    return DEFAULT_LLM_MODELS.get(model_name, DEFAULT_LLM_MODELS["google/gemma-2b-it"])  # Default to gemma-2b-it
