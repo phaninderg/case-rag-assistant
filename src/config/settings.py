@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = os.getenv("OPENAI_API_KEY")
     
     # Model Defaults
-    default_llm: str = os.getenv("DEFAULT_LLM", "mistral-7b")
+    default_llm: str = os.getenv("DEFAULT_LLM", "gemma-2b-it")
     default_embedding: str = os.getenv("DEFAULT_EMBEDDING", "all-mpnet-base-v2")
     
     # Paths
