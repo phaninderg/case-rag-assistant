@@ -10,3 +10,5 @@ data/embeddings/
 debug/
 import.log
 trained_models/
+.DS_Store
+case_task.csv

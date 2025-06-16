@@ -91,16 +91,27 @@ class CaseSearchRequest(BaseModel):
     model_path: Optional[str] = Field(None, description="Optional path to a local model")
 
 class SearchResult(BaseModel):
-    solution: str = Field(..., description="The generated solution text or case content")
+    solution: Optional[str] = Field(None, description="The generated solution text or case content")
     similarity_score: float = Field(..., ge=0.0, le=1.0, description="Similarity score between query and result (0-1)")
     case_number: str = Field(..., description="The case number for reference")
     metadata: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Additional case metadata")
 
 class SearchResponse(BaseModel):
-    results: List[SearchResult] = Field(default_factory=list, description="List of search results")
+    """Response model for case search results."""
+    results: Optional[List[SearchResult]] = Field(
+        None, 
+        description="List of search results (when include_solutions is False)"
+    )
+    ai_summary: Optional[str] = Field(
+        None, 
+        description="AI-generated summary (when include_solutions is True)"
+    )
     query: str = Field(..., description="The original search query")
     total_results: int = Field(0, description="Total number of results found")
-    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata about the search")
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict, 
+        description="Additional metadata about the search"
+    )
 
 class CaseSummaryRequest(BaseModel):
     model_name: Optional[str] = None
@@ -193,29 +204,48 @@ async def search_cases(search_request: CaseSearchRequest):
     """
     Search for similar cases and provide potential solutions.
     
-    This endpoint uses semantic search to find cases similar to the query
-    and can generate AI-powered solutions for the found cases.
+    When include_solutions is True:
+    - Returns a list of case task numbers in the 'case_task_numbers' field
+    - Includes an AI-generated summary in the 'ai_summary' field
+    
+    When include_solutions is False:
+    - Returns detailed case information in the 'results' field
     """
     try:
         # Perform the search
-        results = await llm_service.search_similar_cases(
+        search_results = await llm_service.search_similar_cases(
             query=search_request.query,
             k=search_request.k,
             min_score=search_request.min_score,
             include_solutions=search_request.include_solutions
         )
         
-        return {
-            "results": results,
-            "query": search_request.query,
-            "total_results": len(results),
-            "metadata": {
-                "model": llm_service.model_name,
-                "include_solutions": search_request.include_solutions,
-                "min_score": search_request.min_score
-            }
-        }
-        
+        # Prepare response based on include_solutions flag
+        if search_request.include_solutions:
+            # For AI solutions, we expect a dict with ai_summary
+            return SearchResponse(
+                ai_summary=search_results.get("ai_summary", "No summary available."),
+                query=search_request.query,
+                total_results=search_results.get("total_results", 0),
+                metadata={
+                    "model": llm_service.model_name,
+                    "include_solutions": True,
+                    "min_score": search_request.min_score
+                }
+            )
+        else:
+            # For regular search, we expect a list of results
+            return SearchResponse(
+                results=search_results,
+                query=search_request.query,
+                total_results=len(search_results),
+                metadata={
+                    "model": llm_service.model_name,
+                    "include_solutions": False,
+                    "min_score": search_request.min_score
+                }
+            )
+            
     except Exception as e:
         logger.error(f"Search failed: {str(e)}", exc_info=True)
         raise HTTPException(
@@ -237,7 +267,7 @@ async def summarize_case(
             request = CaseSummaryRequest()
             
         summary = await case_service.generate_case_summary(
-            case_number=case_number,
+            case_task_number=case_number,  # Changed from case_number to case_task_number
             model_name=request.model_name, 
             model_path=request.model_path
         )

@@ -8,6 +8,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from huggingface_hub import login, HfApi
 import os
 import psutil
+import re
 
 from src.config.settings import settings
 
@@ -16,13 +17,13 @@ logger = logging.getLogger(__name__)
 class LLMService:
     """Service for handling LLM interactions with support for multiple providers."""
     
-    def __init__(self, model_path: str = None, model_name: str = "meta-llama/Llama-3.1-8B", case_service: 'CaseService' = None):
+    def __init__(self, model_path: str = None, model_name: str = "google/gemma-2b-it", case_service: 'CaseService' = None):
         """
         Initialize the LLM service.
         
         Args:
             model_path: Path to a fine-tuned model
-            model_name: Name of the base model to use if no path is provided
+            model_name: Name of the base model to use if no path is provided (defaults to Gemma 2B)
             case_service: Instance of CaseService for vector search
         """
         self.model_path = model_path
@@ -41,7 +42,7 @@ class LLMService:
         
         # Setup Hugging Face authentication
         self._setup_huggingface_auth()
-        
+    
     def _setup_huggingface_auth(self):
         """Set up Hugging Face authentication if API key is provided."""
         if settings.huggingface_api_key:
@@ -71,7 +72,7 @@ class LLMService:
     
     def load_model(self, model_identifier: str = None):
         """
-        Load the model and tokenizer with Apple Silicon MPS support.
+        Load the model with 4-bit quantization and memory optimizations.
         """
         if model_identifier is None:
             model_identifier = self.model_path or self.model_name
@@ -85,44 +86,64 @@ class LLMService:
             
             # Configure device settings
             device_map = "auto"
-            torch_dtype = torch.float16
-            load_in_8bit = False
+            torch_dtype = torch.bfloat16
             
             if mps_available:
                 logger.info("Using Apple MPS (Metal) for acceleration")
                 device = torch.device("mps")
                 device_map = {"": device}
                 torch_dtype = torch.float32  # MPS works better with float32
+                load_in_4bit = False  # 4-bit not supported on MPS
+                load_in_8bit = False
             elif torch.cuda.is_available():
                 logger.info("Using CUDA for acceleration")
                 device_map = "auto"
-                torch_dtype = torch.float16
-                load_in_8bit = True
+                torch_dtype = torch.bfloat16
+                load_in_4bit = True  # Prefer 4-bit for CUDA
+                load_in_8bit = False
             else:
-                logger.warning("No GPU acceleration available. Using CPU (slow).")
+                logger.warning("No GPU acceleration available. Using CPU with optimizations.")
                 device_map = None
                 torch_dtype = torch.float32
+                load_in_4bit = False
+                load_in_8bit = False
             
-            # Load tokenizer
+            # Configure tokenizer with proper padding
             self.tokenizer = AutoTokenizer.from_pretrained(
                 model_identifier,
+                padding_side="left",
                 trust_remote_code=True
             )
             
-            # Configure model kwargs
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+            # Configure model kwargs with optimizations
             model_kwargs = {
                 "device_map": device_map,
                 "torch_dtype": torch_dtype,
                 "trust_remote_code": True,
                 "low_cpu_mem_usage": True,
+                "offload_folder": "offload",
             }
             
-            # Only enable 8-bit for CUDA
-            if load_in_8bit:
+            # Apply 4-bit or 8-bit quantization if supported
+            if load_in_4bit:
+                model_kwargs["load_in_4bit"] = True
+                model_kwargs["bnb_4bit_compute_dtype"] = torch_dtype
+                model_kwargs["bnb_4bit_quant_type"] = "nf4"
+                model_kwargs["bnb_4bit_use_double_quant"] = True
+                logger.info("Using 4-bit quantization")
+            elif load_in_8bit:
                 model_kwargs["load_in_8bit"] = True
                 logger.info("Using 8-bit quantization")
             
-            # Load the model
+            # Special handling for Gemma
+            if 'gemma' in model_identifier.lower():
+                model_kwargs["attn_implementation"] = "eager"
+            
+            # Load the model with progress tracking
+            logger.info("Loading model, this may take a few minutes...")
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_identifier,
                 **model_kwargs
@@ -134,6 +155,10 @@ class LLMService:
             # Move model to device if not using device_map
             if device_map is None:
                 self.model = self.model.to("cpu")
+            
+            # Clear CUDA cache if available
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             self._log_memory_usage("After loading model: ")
             logger.info(f"Model loaded successfully on device: {self.model.device}")
@@ -276,31 +301,54 @@ class LLMService:
     
     def _format_chat_prompt(self, messages: List[Dict[str, str]]) -> str:
         """
-        Format chat messages into a single prompt string for the model.
+        Format chat messages into a single prompt string for Gemma.
         
         Args:
             messages: List of message dictionaries with 'role' and 'content' keys
             
         Returns:
-            Formatted prompt string
+            Formatted prompt string for Gemma
         """
-        prompt_parts = []
+        # Special handling for Gemma's chat template
+        if hasattr(self.tokenizer, 'apply_chat_template'):
+            try:
+                # Convert messages to the format expected by apply_chat_template
+                formatted_messages = []
+                for msg in messages:
+                    role = msg['role']
+                    # Map roles to Gemma's expected format
+                    if role == 'system':
+                        formatted_messages.append({"role": "user", "content": msg['content']})
+                        formatted_messages.append({"role": "assistant", "content": "Understood."})
+                    else:
+                        formatted_messages.append({"role": role, "content": msg['content']})
+                
+                # Apply Gemma's chat template
+                return self.tokenizer.apply_chat_template(
+                    formatted_messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+            except Exception as e:
+                logger.warning(f"Error applying chat template: {str(e)}")
+                # Fall through to default formatting
         
+        # Fallback formatting if chat template is not available
+        prompt_parts = []
         for message in messages:
             role = message['role']
             content = message['content'].strip()
             
             if role == 'system':
-                prompt_parts.append(f"### System: {content}")
+                prompt_parts.append(f"<start_of_turn>system\n{content}<end_of_turn>")
             elif role == 'user':
-                prompt_parts.append(f"### User: {content}")
+                prompt_parts.append(f"<start_of_turn>user\n{content}<end_of_turn>")
             elif role == 'assistant':
-                prompt_parts.append(f"### Assistant: {content}")
+                prompt_parts.append(f"<start_of_turn>assistant\n{content}<end_of_turn>")
         
         # Add the assistant's response prefix
-        prompt_parts.append("### Assistant:")
-        
-        return "\n\n".join(prompt_parts)
+        prompt_parts.append("<start_of_turn>assistant\n")
+        return "".join(prompt_parts)
 
     async def summarize_case(self, issue: str, root_cause: str, resolution: str = '') -> str:
         """
@@ -327,23 +375,19 @@ class LLMService:
     async def search_similar_cases(
         self, 
         query: str, 
-        k: int = 5, 
-        min_score: float = 0.6,
+        k: int = 10,  
+        min_score: float = 0.7,  
         include_solutions: bool = False,
         **kwargs
-    ) -> List[Dict[str, Any]]:
+    ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
         """
-        Find similar cases based on the query using ChromaDB vector search.
+        Search for similar cases and optionally generate AI-powered solutions.
         
-        Args:
-            query: Search query string
-            k: Number of results to return
-            min_score: Minimum similarity score (0-1)
-            include_solutions: Whether to include AI-generated solutions (default: False)
-            **kwargs: Additional search parameters
-            
-        Returns:
-            List of solutions with scores in the format expected by SearchResponse
+        When include_solutions is True:
+        - Returns a dictionary with 'ai_summary'
+        
+        When include_solutions is False:
+        - Returns a list of cases with case task number, issue, resolution, and support steps
         """
         logger.info(f"Searching for cases similar to: '{query}' with k={k}, min_score={min_score}")
         
@@ -351,7 +395,7 @@ class LLMService:
             if not self.case_service:
                 raise ValueError("CaseService not provided. Cannot perform vector search.")
             
-            # Get similar cases using case service's vector search
+            # Get similar documents from vector store
             similar_docs = await self.case_service.find_similar_cases(
                 query=query,
                 k=k,
@@ -361,92 +405,204 @@ class LLMService:
             
             if not similar_docs:
                 logger.info("No similar cases found in the vector database.")
-                return []
+                return {"ai_summary": "No similar cases found."} if include_solutions else []
                 
             results = []
+            case_task_numbers = []
+            case_details = []
+            
             for doc in similar_docs:
                 try:
                     # Handle both document objects and dictionaries
-                    if hasattr(doc, 'metadata'):
+                    if hasattr(doc, 'page_content') and hasattr(doc, 'metadata'):
                         metadata = doc.metadata
-                        content = getattr(doc, 'page_content', '')
+                        content = doc.page_content
                     elif isinstance(doc, dict):
                         metadata = doc.get('metadata', {})
-                        content = doc.get('content', '')
-                        if not content and 'page_content' in doc:
-                            content = doc['page_content']
+                        # Get content from 'content' field first, fallback to 'page_content'
+                        content = doc.get('content', doc.get('page_content', ''))
+                        
+                        # If we got content from 'content' field, update metadata with any missing fields
+                        if 'content' in doc and isinstance(metadata, dict):
+                            # Extract fields from content if they're not in metadata
+                            content_fields = {
+                                'issue': self._extract_field_from_content(content, 'ISSUE'),
+                                'root_cause': self._extract_field_from_content(content, 'ROOT_CAUSE'),
+                                'resolution': self._extract_field_from_content(content, 'RESOLUTION'),
+                                'steps_support': self._extract_field_from_content(content, 'STEPS_SUPPORT')
+                            }
+                            # Update metadata with extracted fields if they don't exist
+                            for field, value in content_fields.items():
+                                if value and field not in metadata:
+                                    metadata[field] = value
                     else:
                         logger.warning(f"Unexpected document type: {type(doc)}")
                         continue
                     
-                    # Get the similarity score and case number
-                    score = doc.get('score', metadata.get('score', 0.0))
-                    case_number = metadata.get('case_task_number', 'N/A')
+                    # Get case number from metadata
+                    case_number = metadata.get('case_task_number')
+                    if not case_number:
+                        logger.warning(f"Document has no case_task_number in metadata")
+                        continue
+                        
+                    logger.debug(f"Processing case: {case_number}")
                     
-                    # Create a clean metadata dictionary without parent_case
-                    clean_metadata = {
-                        key: value 
-                        for key, value in metadata.items() 
-                        if key != 'parent_case' and key != 'case_task_number'
-                    }
+                    # Extract fields from metadata with fallback to empty string
+                    issue = metadata.get('issue', '')
+                    root_cause = metadata.get('root_cause', '')
+                    resolution = metadata.get('resolution', '')
+                    steps_support = metadata.get('steps_support', metadata.get('steps_support', ''))
                     
-                    # Prepare the base result
+                    # If any field is missing, try to extract from content
+                    if not all([issue, root_cause, resolution, steps_support]) and content:
+                        logger.debug("Some fields missing from metadata, trying to extract from content")
+                        issue = issue or self._extract_field_from_content(content, 'ISSUE')
+                        root_cause = root_cause or self._extract_field_from_content(content, 'ROOT_CAUSE')
+                        resolution = resolution or self._extract_field_from_content(content, 'RESOLUTION')
+                        steps_support = steps_support or self._extract_field_from_content(content, 'STEPS_SUPPORT')
+                    
+                    # Log if we still couldn't find all fields
+                    if not all([issue, root_cause, resolution, steps_support]):
+                        missing = [f for f, v in [
+                            ('issue', issue),
+                            ('root_cause', root_cause),
+                            ('resolution', resolution),
+                            ('steps_support', steps_support)
+                        ] if not v]
+                        logger.warning(f"Could not extract fields: {', '.join(missing)}")
+                    
+                    # Add to case task numbers list
+                    case_task_numbers.append(str(case_number))
+                    
+                    # Prepare the result
                     result = {
-                        'similarity_score': score,
                         'case_number': case_number,
-                        'metadata': clean_metadata  # Use the filtered metadata
+                        'similarity_score': doc.get('score', 0.0),
+                        'issue': issue,
+                        'root_cause': root_cause,
+                        'resolution': resolution,
+                        'support_steps': steps_support,
+                        'metadata': {
+                            'case_task_number': case_number,
+                            'issue': issue,
+                            'root_cause': root_cause,
+                            'resolution': resolution,
+                            'support_steps': steps_support,
+                            'parent_case': metadata.get('parent_case'),
+                            'created_at': metadata.get('created_at'),
+                            'updated_at': metadata.get('updated_at')
+                        }
                     }
                     
-                    # Generate AI solution if requested
-                    if include_solutions and content:
-                        try:
-                            # Create a prompt for generating a solution
-                            prompt = (
-                                "Generate a concise solution for the following support case. "
-                                "Focus on the key resolution steps and provide actionable advice.\n\n"
-                                f"Case Details:\n{content[:4000]}"
-                            )
-                            
-                            # Generate the solution using the LLM
-                            solution_response = await self.generate_response(
-                                messages=[{"role": "user", "content": prompt}],
-                                max_length=500,
-                                temperature=0.3  # Lower temperature for more focused responses
-                            )
-                            
-                            if isinstance(solution_response, dict) and 'content' in solution_response:
-                                result['solution'] = solution_response['content'].strip()
-                                result['is_ai_generated'] = True
-                            else:
-                                # Fallback to first 500 chars if AI generation fails
-                                result['solution'] = content[:500]
-                                result['is_ai_generated'] = False
-                                
-                        except Exception as e:
-                            logger.error(f"Error generating AI solution: {str(e)}", exc_info=True)
-                            # Fallback to first 500 chars if there's an error
-                            result['solution'] = content[:500]
-                            result['is_ai_generated'] = False
-                    else:
-                        # If not generating AI solutions, just use the first 500 chars
-                        result['solution'] = content[:500]
-                        result['is_ai_generated'] = False
-                    
+                    # Collect case details for AI summary
+                    if include_solutions:
+                        case_details.append({
+                            'case_number': case_number,
+                            'issue': issue,
+                            'resolution': resolution,
+                            'support_steps': steps_support,
+                            'root_cause': root_cause
+                        })
+                        continue
+                        
+                    # Add to results list
                     results.append(result)
                     
                 except Exception as e:
                     logger.error(f"Error processing search result: {str(e)}", exc_info=True)
                     continue
             
-            # Sort by score (highest first)
-            results.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
+            # Generate AI summary if include_solutions is True
+            ai_summary = ""
+            if include_solutions and case_details:
+                try:
+                    # Prepare cases text for AI analysis
+                    cases_text = "\n\n".join([
+                        f"Case {case['case_number']}:\n"
+                        f"Root Cause: {case.get('root_cause', 'Not specified')}\n"
+                        f"Resolution: {case.get('resolution', 'Not specified')}\n"
+                        f"Support Steps: {case.get('support_steps', 'Not specified')}"
+                        for case in case_details
+                    ])
+                    
+                    prompt = (
+                        "Analyze the following support cases and provide a comprehensive summary "
+                        "that focuses on the root causes, resolutions, and support steps. "
+                        "Your summary should be based ONLY on the information provided in these cases.\n\n"
+                        f"Search Query: {query}\n\n"
+                        f"Relevant Cases:\n{cases_text}\n\n"
+                        "Provide a well-structured summary with these sections, using ONLY the information from the cases above:\n"
+                        "1. Root Causes Identified (list the main causes mentioned in the cases as bullet points without specifying case task numbers)\n"
+                        "2. Resolution Steps (summarize the key steps taken to resolve the issues as bullet points without specifying case task numbers)\n"
+                        "3. Support Process (describe the support process followed as bullet points without specifying case task numbers)\n"
+                        "4. Case References (list of case numbers used in the analysis)\n\n"
+                    )
+                    
+                    # Generate the summary using the LLM
+                    summary_response = await self.generate_response(
+                        messages=[{"role": "user", "content": prompt}],
+                        max_length=1500,  # Increased length for more detailed summary
+                        temperature=0.2  # Lower temperature for more focused responses
+                    )
+                    
+                    if isinstance(summary_response, dict) and 'content' in summary_response:
+                        ai_summary = summary_response['content'].strip()
+                    else:
+                        ai_summary = "Unable to generate summary at this time."
+                        
+                except Exception as e:
+                    logger.error(f"Error generating AI summary: {str(e)}", exc_info=True)
+                    ai_summary = "An error occurred while generating the summary."
             
-            logger.info(f"Returning {len(results)} results with AI-generated solutions: {include_solutions}")
-            return results[:k]
-            
+            # Return appropriate response based on include_solutions flag
+            if include_solutions:
+                return {
+                    'ai_summary': ai_summary,
+                    'query': query,
+                    'total_results': len(case_task_numbers)
+                }
+            else:
+                return results
+                
         except Exception as e:
             logger.error(f"Error in search_similar_cases: {str(e)}", exc_info=True)
-            raise
+            # Return empty result in the expected format
+            return {"ai_summary": "An error occurred while processing your request."} if include_solutions else []
+    
+    def _extract_field_from_content(self, content: str, field_name: str) -> str:
+        """
+        Extract a field from the content string.
+        
+        Args:
+            content: The content string to extract from
+            field_name: The name of the field to extract
+            
+        Returns:
+            The extracted field value or an empty string if not found
+        """
+        if not content:
+            return ''
+            
+        # Try different patterns to match the field
+        patterns = [
+            rf'^{field_name.upper()}:\s*(.*?)(?:\n|$)',  # UPPERCASE:
+            rf'^{field_name.title()}:\s*(.*?)(?:\n|$)',  # Title Case:
+            rf'^{field_name.replace("_", " ").title()}:\s*(.*?)(?:\n|$)'  # Title Case with spaces:
+        ]
+        
+        for pattern_str in patterns:
+            try:
+                pattern = re.compile(pattern_str, re.MULTILINE | re.DOTALL)
+                match = pattern.search(content)
+                if match:
+                    result = match.group(1).strip()
+                    logger.debug(f"Extracted {field_name} using pattern: {pattern_str}")
+                    return result
+            except Exception as e:
+                logger.debug(f"Error with pattern {pattern_str}: {str(e)}")
+        
+        logger.debug(f"Could not find {field_name} in content")
+        return ''
 
     def get_embedding(self, text: str) -> List[float]:
         """
@@ -835,7 +991,7 @@ class LLMService:
             
             # Generate response
             response = await self.generate_response(
-                prompt=prompt,
+                messages=[{"role": "user", "content": prompt}],
                 **{k: v for k, v in generation_params.items() 
                    if k not in ['prompt']}
             )

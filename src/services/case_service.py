@@ -190,21 +190,35 @@ class CaseService:
                 return None
                 
             doc = results[0]
+            
+            # Extract content from either page_content or content field
+            content = doc.page_content if hasattr(doc, 'page_content') else getattr(doc, 'content', '')
             metadata = doc.metadata
             
+            # Helper function to extract field from content
+            def extract_field(field_name):
+                pattern = fr"{field_name}:\s*([^\n]+)"
+                match = re.search(pattern, content, re.IGNORECASE)
+                return match.group(1).strip() if match else ""
+            
+            # Try to extract fields from content first, fallback to metadata
+            issue = extract_field("ISSUE") or metadata.get("issue", "")
+            root_cause = extract_field("ROOT_CAUSE") or metadata.get("root_cause", "")
+            resolution = extract_field("RESOLUTION") or metadata.get("resolution", "")
+            steps_support = extract_field("STEPS_SUPPORT") or metadata.get("steps_support", "")
+            
             return {
-                "case_task_number": metadata.get("case_task_number", ""),
+                "case_task_number": case_task_number,
                 "parent_case": metadata.get("parent_case"),
-                "issue": metadata.get("issue", ""),
-                "root_cause": metadata.get("root_cause", ""),
-                "resolution": metadata.get("resolution", ""),
-                "steps_support": metadata.get("steps_support", ""),
-                "created_at": metadata.get("created_at", ""),
-                "updated_at": metadata.get("updated_at", "")
+                "issue": issue,
+                "root_cause": root_cause,
+                "resolution": resolution,
+                "steps_support": steps_support,
+                "metadata": metadata
             }
             
         except Exception as e:
-            logger.error(f"Error retrieving case by task number {case_task_number}: {str(e)}", exc_info=True)
+            logger.error(f"Error retrieving case {case_task_number}: {str(e)}", exc_info=True)
             return None
 
     def get_case(self, case_task_number: str) -> Optional[Dict[str, Any]]:
