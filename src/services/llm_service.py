@@ -1,12 +1,13 @@
 import logging
-from typing import Dict, List, Optional, Any, AsyncGenerator
+from typing import Dict, List, Optional, Any, AsyncGenerator, Union
 import torch
 from langchain.schema import HumanMessage, SystemMessage, AIMessage, BaseMessage
 from langchain.callbacks.manager import CallbackManager
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from huggingface_hub import login, HfApi
 import os
+import psutil
 
 from src.config.settings import settings
 
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 class LLMService:
     """Service for handling LLM interactions with support for multiple providers."""
     
-    def __init__(self, model_path: str = None, model_name: str = "distilgpt2", case_service: 'CaseService' = None):
+    def __init__(self, model_path: str = None, model_name: str = "meta-llama/Llama-3.1-8B", case_service: 'CaseService' = None):
         """
         Initialize the LLM service.
         
@@ -31,6 +32,11 @@ class LLMService:
         logger.info(f"Using device: {self.device}")
         self.model = None
         self.tokenizer = None
+        
+        # Configure environment for Apple Silicon
+        os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
+        
+        # Load model
         self.load_model(model_path or model_name)
         
         # Setup Hugging Face authentication
@@ -46,93 +52,255 @@ class LLMService:
                 logger.warning(f"Failed to login to Hugging Face Hub: {str(e)}")
     
     def _get_device(self):
-        """Force CPU usage for all operations."""
-        logger.info("Using CPU for all operations")
-        return "cpu"
+        """Get the appropriate device for model inference."""
+        if torch.cuda.is_available():
+            logger.info("Using CUDA device")
+            return "cuda"
+        elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+            logger.info("Using MPS device")
+            return "mps"
+        else:
+            logger.info("Using CPU")
+            return "cpu"
 
-    def load_model(self, model_path: str = None):
+    def _log_memory_usage(self, prefix: str = ""):
+        """Log current memory usage."""
+        process = psutil.Process()
+        mem_info = process.memory_info()
+        logger.info(f"{prefix}Memory usage: {mem_info.rss / 1024 / 1024:.2f} MB")
+    
+    def load_model(self, model_identifier: str = None):
         """
-        Load the model and tokenizer.
+        Load the model and tokenizer with Apple Silicon MPS support.
+        """
+        if model_identifier is None:
+            model_identifier = self.model_path or self.model_name
+            
+        logger.info(f"Loading model: {model_identifier}")
+        self._log_memory_usage("Before loading model: ")
         
-        Args:
-            model_path: Path to the model to load
-        """
         try:
-            if model_path:
-                self.model_path = model_path
-                logger.info(f"Loading model from {model_path}")
-                
-                # Load tokenizer first
-                self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-                
-                # Configure padding token if needed
-                if self.tokenizer.pad_token is None:
-                    self.tokenizer.pad_token = self.tokenizer.eos_token
-                
-                # Load model with appropriate settings
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_path,
-                    torch_dtype=torch.float32  # Use float32 for better compatibility
-                ).to(self.device)
-                
-                logger.info(f"Successfully loaded model on {self.device}")
+            # Check for Apple Silicon MPS
+            mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+            
+            # Configure device settings
+            device_map = "auto"
+            torch_dtype = torch.float16
+            load_in_8bit = False
+            
+            if mps_available:
+                logger.info("Using Apple MPS (Metal) for acceleration")
+                device = torch.device("mps")
+                device_map = {"": device}
+                torch_dtype = torch.float32  # MPS works better with float32
+            elif torch.cuda.is_available():
+                logger.info("Using CUDA for acceleration")
+                device_map = "auto"
+                torch_dtype = torch.float16
+                load_in_8bit = True
             else:
-                logger.info(f"Using default model: {self.model_name}")
-                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-                
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name,
-                    torch_dtype=torch.float32
-                ).to(self.device)
-                
+                logger.warning("No GPU acceleration available. Using CPU (slow).")
+                device_map = None
+                torch_dtype = torch.float32
+            
+            # Load tokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_identifier,
+                trust_remote_code=True
+            )
+            
+            # Configure model kwargs
+            model_kwargs = {
+                "device_map": device_map,
+                "torch_dtype": torch_dtype,
+                "trust_remote_code": True,
+                "low_cpu_mem_usage": True,
+            }
+            
+            # Only enable 8-bit for CUDA
+            if load_in_8bit:
+                model_kwargs["load_in_8bit"] = True
+                logger.info("Using 8-bit quantization")
+            
+            # Load the model
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_identifier,
+                **model_kwargs
+            )
+            
+            # Set model to eval mode
+            self.model.eval()
+            
+            # Move model to device if not using device_map
+            if device_map is None:
+                self.model = self.model.to("cpu")
+            
+            self._log_memory_usage("After loading model: ")
+            logger.info(f"Model loaded successfully on device: {self.model.device}")
+            
         except Exception as e:
-            logger.error(f"Error loading model: {str(e)}", exc_info=True)
+            logger.error(f"Error loading model {model_identifier}: {str(e)}")
+            self._log_memory_usage("Error loading model: ")
             raise
 
-    async def generate_response(self, prompt: str, max_length: int = 200, **kwargs) -> str:
+    async def generate_response(
+        self,
+        messages: Union[str, List[Dict[str, str]]],
+        max_length: int = 1000,
+        temperature: float = 0.7,
+        stream: bool = False,
+        **kwargs
+    ) -> Union[str, Dict[str, Any]]:
         """
-        Generate a response using the loaded model.
+        Generate a response for the given prompt or chat messages.
         
         Args:
-            prompt: Input prompt for generation
-            max_length: Maximum length of the generated response
+            messages: Either a string prompt or a list of message dictionaries with 'role' and 'content' keys
+            max_length: Maximum length of the generated response in tokens
+            temperature: Sampling temperature (0.0 to 2.0)
+            stream: Whether to stream the response (not yet implemented)
             **kwargs: Additional generation parameters
             
         Returns:
-            str: Generated text response
+            If input is a string, returns a string response.
+            If input is a list of messages, returns a dictionary with 'content' and 'usage' keys.
         """
+        logger.info("Starting generate_response")
         try:
             if not self.model or not self.tokenizer:
-                raise ValueError("Model or tokenizer not loaded. Call load_model() first.")
-                
+                error_msg = "Model or tokenizer not loaded. Call load_model() first."
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            
+            # Handle both string prompts and chat messages
+            if isinstance(messages, str):
+                logger.debug("Processing string prompt")
+                prompt = messages
+                is_chat = False
+            else:
+                logger.debug(f"Processing {len(messages)} chat messages")
+                # Format chat messages into a single prompt
+                prompt = self._format_chat_prompt(messages)
+                is_chat = True
+            
+            logger.debug(f"Generated prompt (first 200 chars): {prompt[:200]}...")
+            
+            # Tokenize the prompt
+            logger.debug("Tokenizing prompt...")
             inputs = self.tokenizer(
                 prompt,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=512
+                max_length=4096 - max_length,  # Leave room for response
+                return_token_type_ids=False
             ).to(self.device)
             
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_length=max_length,
-                    num_return_sequences=1,
-                    temperature=0.7,
-                    top_p=0.9,
-                    **kwargs
-                )
+            logger.debug(f"Input tensors prepared on device: {self.device}")
             
-            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            # Extract just the response part if it follows the instruction format
-            if "### Response:" in response:
-                response = response.split("### Response:")[1].strip()
-            return response
+            # Prepare generation parameters
+            generation_params = {
+                'max_new_tokens': max_length,
+                'temperature': temperature,
+                'do_sample': temperature > 0,
+                'top_p': 0.9 if temperature > 0 else 1.0,
+                'pad_token_id': self.tokenizer.eos_token_id,
+            }
             
+            # Filter out any None values and update with any additional kwargs
+            generation_params = {k: v for k, v in generation_params.items() if v is not None}
+            
+            # Add any additional kwargs that don't conflict
+            for k, v in kwargs.items():
+                if k not in generation_params and v is not None:
+                    generation_params[k] = v
+            
+            logger.debug(f"Generation parameters: {generation_params}")
+            
+            # Generate response
+            logger.info("Generating response...")
+            try:
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **inputs,
+                        **generation_params
+                    )
+                logger.debug("Successfully generated response")
+            except Exception as e:
+                logger.error(f"Error during model.generate(): {str(e)}", exc_info=True)
+                raise
+            
+            # Decode the response
+            logger.debug("Decoding response...")
+            response_text = self.tokenizer.decode(
+                outputs[0][inputs.input_ids.shape[1]:],
+                skip_special_tokens=True
+            ).strip()
+            
+            logger.debug(f"Decoded response (first 200 chars): {response_text[:200]}...")
+            
+            # For chat responses, return a structured format
+            if is_chat:
+                # Calculate token usage
+                prompt_tokens = inputs.input_ids.shape[1]
+                completion_tokens = len(outputs[0]) - prompt_tokens
+                
+                logger.info(f"Generated response with {completion_tokens} tokens")
+                
+                return {
+                    "content": response_text,
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens
+                    }
+                }
+            else:
+                # For simple prompts, just return the text
+                logger.info("Returning simple prompt response")
+                return response_text
+                
         except Exception as e:
-            logger.error(f"Error generating response: {str(e)}", exc_info=True)
-            raise
+            error_msg = f"Error in generate_response: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            if is_chat:
+                return {
+                    "content": f"Error: {error_msg}",
+                    "usage": {
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0
+                    }
+                }
+            return f"Error: {error_msg}"
+    
+    def _format_chat_prompt(self, messages: List[Dict[str, str]]) -> str:
+        """
+        Format chat messages into a single prompt string for the model.
+        
+        Args:
+            messages: List of message dictionaries with 'role' and 'content' keys
+            
+        Returns:
+            Formatted prompt string
+        """
+        prompt_parts = []
+        
+        for message in messages:
+            role = message['role']
+            content = message['content'].strip()
+            
+            if role == 'system':
+                prompt_parts.append(f"### System: {content}")
+            elif role == 'user':
+                prompt_parts.append(f"### User: {content}")
+            elif role == 'assistant':
+                prompt_parts.append(f"### Assistant: {content}")
+        
+        # Add the assistant's response prefix
+        prompt_parts.append("### Assistant:")
+        
+        return "\n\n".join(prompt_parts)
 
     async def summarize_case(self, issue: str, root_cause: str, resolution: str = '') -> str:
         """
@@ -161,7 +329,7 @@ class LLMService:
         query: str, 
         k: int = 5, 
         min_score: float = 0.6,
-        include_solutions: bool = True,
+        include_solutions: bool = False,
         **kwargs
     ) -> List[Dict[str, Any]]:
         """
@@ -171,16 +339,15 @@ class LLMService:
             query: Search query string
             k: Number of results to return
             min_score: Minimum similarity score (0-1)
-            include_solutions: Whether to include AI-generated solutions
+            include_solutions: Whether to include AI-generated solutions (default: False)
             **kwargs: Additional search parameters
             
         Returns:
-            List of solutions with scores
+            List of solutions with scores in the format expected by SearchResponse
         """
+        logger.info(f"Searching for cases similar to: '{query}' with k={k}, min_score={min_score}")
+        
         try:
-            if not self.model or not self.tokenizer:
-                raise ValueError("Model or tokenizer not loaded. Call load_model() first.")
-            
             if not self.case_service:
                 raise ValueError("CaseService not provided. Cannot perform vector search.")
             
@@ -196,7 +363,7 @@ class LLMService:
                 logger.info("No similar cases found in the vector database.")
                 return []
                 
-            solutions = []
+            results = []
             for doc in similar_docs:
                 try:
                     # Handle both document objects and dictionaries
@@ -212,114 +379,70 @@ class LLMService:
                         logger.warning(f"Unexpected document type: {type(doc)}")
                         continue
                     
-                    # Get the similarity score
+                    # Get the similarity score and case number
                     score = doc.get('score', metadata.get('score', 0.0))
+                    case_number = metadata.get('case_task_number', 'N/A')
                     
-                    # If no solution needed or possible, return basic info
-                    if not include_solutions:
-                        solution_text = content[:500]  # Return first 500 chars if no solution needed
-                    else:
-                        # Extract key information from the case
-                        case_number = metadata.get('case_task_number', 'N/A')
-                        parent_case = metadata.get('parent_case', '')
-                        case_task_tags = metadata.get('case_task_tags', '')
-                        
-                        # Try to get fields from metadata first, then parse from content if not found
-                        issue = metadata.get('issue', '')
-                        root_cause = metadata.get('root_cause', '')
-                        resolution = metadata.get('resolution', '').strip()
-                        steps_support = metadata.get('steps_support', '').strip()
-                        
-                        # If any field is missing, try to parse from page content
-                        if not all([issue, root_cause, resolution, steps_support]) and content:
-                            content_lower = content.lower()
-                            lines = content.split('\n')
-                            
-                            # Parse fields from content
-                            content_fields = {}
-                            current_field = None
-                            
-                            for line in lines:
-                                line_lower = line.lower()
-                                if 'issue:' in line_lower:
-                                    current_field = 'issue'
-                                    content_fields[current_field] = line.split(':', 1)[1].strip() if ':' in line else ''
-                                elif 'root_cause:' in line_lower or 'root cause:' in line_lower:
-                                    current_field = 'root_cause'
-                                    content_fields[current_field] = line.split(':', 1)[1].strip() if ':' in line else ''
-                                elif 'resolution:' in line_lower:
-                                    current_field = 'resolution'
-                                    content_fields[current_field] = line.split(':', 1)[1].strip() if ':' in line else ''
-                                elif 'steps_support:' in line_lower or 'steps support:' in line_lower:
-                                    current_field = 'steps_support'
-                                    content_fields[current_field] = line.split(':', 1)[1].strip() if ':' in line else ''
-                                elif current_field and line.strip():
-                                    # Append to current field if we're in a multi-line value
-                                    content_fields[current_field] += '\n' + line.strip()
-                            
-                            # Update fields from content if they were missing from metadata
-                            issue = issue or content_fields.get('issue', '')
-                            root_cause = root_cause or content_fields.get('root_cause', '')
-                            resolution = resolution or content_fields.get('resolution', '').strip()
-                            steps_support = steps_support or content_fields.get('steps_support', '').strip()
-                        
-                        # Use resolution and steps_support as the basis for the solution
-                        prompt = (
-                            "Based on the following case details, provide a concise 2-3 sentence solution summary. "
-                            "Focus on the key resolution steps and final outcome.\n\n"
-                            "### Case Information ###\n"
-                            f"Case Number: {case_number}\n"
-                            f"Parent Case: {parent_case if parent_case else 'None'}\n"
-                            "### Issue Description ###\n"
-                            f"{issue if issue else 'No issue description'}\n\n"
-                            "### Root Cause ###\n"
-                            f"{root_cause if root_cause else 'No root cause provided'}\n\n"
-                            "### Resolution Details ###\n"
-                            f"{resolution if resolution else 'No resolution details provided'}\n\n"
-                            "### Support Steps ###\n"
-                            f"{steps_support if steps_support else 'No support steps provided'}"
-                        )
-                        
+                    # Create a clean metadata dictionary without parent_case
+                    clean_metadata = {
+                        key: value 
+                        for key, value in metadata.items() 
+                        if key != 'parent_case' and key != 'case_task_number'
+                    }
+                    
+                    # Prepare the base result
+                    result = {
+                        'similarity_score': score,
+                        'case_number': case_number,
+                        'metadata': clean_metadata  # Use the filtered metadata
+                    }
+                    
+                    # Generate AI solution if requested
+                    if include_solutions and content:
                         try:
-                            response = await self.generate_response(
-                                messages=[
-                                    {"role": "system", "content": "You are a technical support assistant that provides clear, concise solutions based on case details. Only include the solution text, no headers or formatting."},
-                                    {"role": "user", "content": prompt}
-                                ],
-                                temperature=0.3,
-                                max_tokens=300,
-                                stream=False
+                            # Create a prompt for generating a solution
+                            prompt = (
+                                "Generate a concise solution for the following support case. "
+                                "Focus on the key resolution steps and provide actionable advice.\n\n"
+                                f"Case Details:\n{content[:4000]}"
                             )
                             
-                            # Extract and clean the response
-                            solution_text = response.get('content', '').strip()
+                            # Generate the solution using the LLM
+                            solution_response = await self.generate_response(
+                                messages=[{"role": "user", "content": prompt}],
+                                max_length=500,
+                                temperature=0.3  # Lower temperature for more focused responses
+                            )
                             
-                            # Clean up any remaining artifacts
-                            solution_text = solution_text.replace('"', '').strip()
-                            
-                            # Ensure we have a valid response
-                            if not solution_text or len(solution_text.split()) < 3:
-                                solution_text = "No detailed solution could be generated from the case details."
-                            
+                            if isinstance(solution_response, dict) and 'content' in solution_response:
+                                result['solution'] = solution_response['content'].strip()
+                                result['is_ai_generated'] = True
+                            else:
+                                # Fallback to first 500 chars if AI generation fails
+                                result['solution'] = content[:500]
+                                result['is_ai_generated'] = False
+                                
                         except Exception as e:
-                            logger.error(f"Error generating solution: {str(e)}", exc_info=True)
-                            solution_text = "Error generating solution from case details."
+                            logger.error(f"Error generating AI solution: {str(e)}", exc_info=True)
+                            # Fallback to first 500 chars if there's an error
+                            result['solution'] = content[:500]
+                            result['is_ai_generated'] = False
+                    else:
+                        # If not generating AI solutions, just use the first 500 chars
+                        result['solution'] = content[:500]
+                        result['is_ai_generated'] = False
                     
-                    # Add to results
-                    solutions.append({
-                        'solution': solution_text,
-                        'similarity_score': score,
-                        'case_number': metadata.get('case_task_number', 'N/A')
-                    })
+                    results.append(result)
                     
                 except Exception as e:
-                    logger.error(f"Error processing document: {str(e)}", exc_info=True)
+                    logger.error(f"Error processing search result: {str(e)}", exc_info=True)
                     continue
             
-            # Sort by similarity score (highest first)
-            solutions.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
+            # Sort by score (highest first)
+            results.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
             
-            return solutions
+            logger.info(f"Returning {len(results)} results with AI-generated solutions: {include_solutions}")
+            return results[:k]
             
         except Exception as e:
             logger.error(f"Error in search_similar_cases: {str(e)}", exc_info=True)
@@ -532,112 +655,6 @@ class LLMService:
         
         return formatted_prompt
     
-    async def generate(
-        self,
-        prompt: str,
-        system_message: Optional[str] = None,
-        chat_history: Optional[List[Dict[str, str]]] = None,
-        **kwargs
-    ) -> str:
-        """
-        Generate a response from the LLM with robust error handling for tensor shapes.
-        
-        Args:
-            prompt: The user's input prompt
-            system_message: Optional system message
-            chat_history: List of previous messages
-            **kwargs: Additional parameters for generation
-            
-        Returns:
-            The generated response as a string
-        """
-        if not self.model or not self.tokenizer:
-            raise RuntimeError("Model not initialized. Please check the logs for initialization errors.")
-        
-        try:
-            # Format the prompt with strict truncation
-            formatted_prompt = self._format_prompt(prompt, system_message, chat_history)
-            
-            # Log the prompt length for debugging
-            prompt_length = len(formatted_prompt.split())
-            logger.debug(f"Generating response for prompt (tokens: ~{prompt_length})")
-            
-            # Set conservative generation parameters
-            generation_kwargs = {
-                'max_new_tokens': 512,  # Limit response length
-                'temperature': 0.7,    # Balanced creativity
-                'top_p': 0.9,          # Nucleus sampling
-                'do_sample': True,     # Enable sampling
-                'num_return_sequences': 1,
-                'eos_token_id': self.tokenizer.eos_token_id if hasattr(self.tokenizer, 'eos_token_id') else None,
-                'pad_token_id': self.tokenizer.pad_token_id if hasattr(self.tokenizer, 'pad_token_id') else None,
-                **kwargs
-            }
-            
-            # Try with a smaller batch size if needed
-            if 'batch_size' not in generation_kwargs:
-                generation_kwargs['batch_size'] = 1
-            
-            # Generate the response with error handling
-            try:
-                inputs = self.tokenizer(
-                    formatted_prompt,
-                    return_tensors="pt",
-                    max_length=512,
-                    truncation=True,
-                    padding=True
-                ).to(self.device)
-                
-                with torch.no_grad():
-                    outputs = self.model.generate(
-                        **inputs,
-                        **generation_kwargs
-                    )
-                
-                # Extract and clean the generated text
-                if hasattr(outputs, 'shape'):
-                    if outputs.shape and len(outputs.shape) > 0:
-                        generation = outputs[0]
-                        if hasattr(generation, 'cpu'):
-                            generation = generation.cpu()
-                        if hasattr(generation, 'numpy'):
-                            generation = generation.numpy()
-                        return str(generation).strip()
-                
-                return "No response generated"
-                
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower() or "cuda out of memory" in str(e).lower():
-                    logger.warning("CUDA out of memory, trying with reduced batch size")
-                    generation_kwargs['batch_size'] = 1
-                    inputs = self.tokenizer(
-                        formatted_prompt,
-                        return_tensors="pt",
-                        max_length=512,
-                        truncation=True,
-                        padding=True
-                    ).to(self.device)
-                    
-                    with torch.no_grad():
-                        outputs = self.model.generate(
-                            **inputs,
-                            **generation_kwargs
-                        )
-                    
-                    if hasattr(outputs, 'shape'):
-                        if outputs.shape and len(outputs.shape) > 0:
-                            generation = outputs[0]
-                            if hasattr(generation, 'cpu'):
-                                generation = generation.cpu()
-                            if hasattr(generation, 'numpy'):
-                                generation = generation.numpy()
-                            return str(generation).strip()
-                raise
-                
-        except Exception as e:
-            logger.error(f"Error in generate: {str(e)}", exc_info=True)
-            raise RuntimeError(f"Failed to generate response: {str(e)}")
-    
     async def stream(
         self,
         prompt: str,
@@ -716,114 +733,67 @@ class LLMService:
             logger.error(error_msg, exc_info=True)
             yield f"Error: {error_msg}"
     
-    async def generate_response(self, prompt: str, max_length: int = 256, **kwargs) -> str:
+    async def stream_response(
+        self,
+        prompt: str,
+        max_length: int = 1000,
+        **generation_params
+    ) -> AsyncGenerator[str, None]:
         """
-        Generate a response for the given prompt using the current model.
+        Stream the model's response token by token.
         
         Args:
             prompt: The input prompt
-            max_length: Maximum length of the generated response in tokens
-            **kwargs: Additional generation parameters (will override defaults)
+            max_length: Maximum length of the generated response
+            **generation_params: Additional generation parameters
             
-        Returns:
-            Generated text response
+        Yields:
+            str: The next token in the generated response
         """
         try:
             if not self.model or not self.tokenizer:
                 raise ValueError("Model or tokenizer not loaded. Call load_model() first.")
-            
-            # Ensure model is on the correct device
-            self.model = self.model.to(self.device)
                 
-            # Set default generation parameters with more stable values
-            default_params = {
-                'max_new_tokens': min(max_length, 300),
-                'temperature': 0.7,  # Default temperature
-                'top_p': 0.9,
-                'top_k': 50,
-                'repetition_penalty': 1.1,  # Slightly lower to avoid extreme values
-                'no_repeat_ngram_size': 3,
-                'do_sample': True,
-                'num_beams': 1,  # Start with greedy decoding
-                'early_stopping': True,
-                'length_penalty': 1.0,
-                'pad_token_id': self.tokenizer.eos_token_id,
-                'eos_token_id': self.tokenizer.eos_token_id
-            }
-            
-            # Update defaults with any provided kwargs
-            generation_params = {**default_params, **kwargs}
-            
-            # Encode the input
+            # Tokenize the input
             inputs = self.tokenizer(
                 prompt,
                 return_tensors="pt",
-                max_length=512,
+                padding=True,
                 truncation=True,
-                padding=True
-            )
+                max_length=512
+            ).to(self.device)
             
-            # Move inputs to the same device as the model
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
-            # First try with standard parameters
-            try:
-                with torch.no_grad():
-                    outputs = self.model.generate(
-                        **inputs,
-                        **{k: v for k, v in generation_params.items() 
-                           if k not in inputs and k != 'prompt'}
-                    )
-            except RuntimeError as e:
-                if 'probability tensor' in str(e).lower():
-                    # If we get probability errors, try with more stable settings
-                    logger.warning("Probability error detected, retrying with more stable parameters")
-                    stable_params = {
-                        'temperature': 0.7,
-                        'top_p': 0.9,
-                        'top_k': 0,  # Disable top_k sampling for more stability
-                        'do_sample': True,
-                        'num_beams': 1,  # Use greedy decoding
-                        'repetition_penalty': 1.0  # No repetition penalty
-                    }
-                    generation_params.update(stable_params)
-                    
-                    with torch.no_grad():
-                        outputs = self.model.generate(
-                            **inputs,
-                            **generation_params
-                        )
-                else:
-                    raise
-            
-            # Handle different output formats
-            if hasattr(outputs, 'sequences'):
-                output_sequences = outputs.sequences
-            elif isinstance(outputs, torch.Tensor):
-                output_sequences = outputs
-            else:
-                output_sequences = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
-            
-            # Move to CPU for decoding if needed
-            if output_sequences.device != torch.device('cpu'):
-                output_sequences = output_sequences.cpu()
-            
-            # Decode the response
-            response = self.tokenizer.decode(
-                output_sequences[0], 
-                skip_special_tokens=True
-            )
-            
-            # Remove the input prompt from the response if it's included
-            if response.startswith(prompt):
-                response = response[len(prompt):].strip()
+            # Set default generation parameters if not provided
+            if 'max_length' not in generation_params:
+                generation_params['max_length'] = max_length
+            if 'temperature' not in generation_params:
+                generation_params['temperature'] = 0.7
+            if 'top_p' not in generation_params:
+                generation_params['top_p'] = 0.9
                 
-            return response
-            
+            # Generate tokens one by one
+            with torch.no_grad():
+                for output in self.model.generate(
+                    **inputs,
+                    max_new_tokens=generation_params.get('max_length', max_length),
+                    temperature=generation_params.get('temperature'),
+                    top_p=generation_params.get('top_p'),
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    **{k: v for k, v in generation_params.items() 
+                       if k not in ['max_length', 'temperature', 'top_p', 'do_sample']}
+                ):
+                    # Decode the new tokens
+                    new_text = self.tokenizer.decode(output[0], skip_special_tokens=True)
+                    # Skip the prompt in the first chunk
+                    if len(new_text) <= len(prompt):
+                        continue
+                    # Yield only the new text
+                    yield new_text[len(prompt):]
+                    
         except Exception as e:
-            logger.error(f"Error generating response: {str(e)}", exc_info=True)
-            # Return a simple error message that can be handled upstream
-            return f"Error generating response: {str(e)}"
+            logger.error(f"Error in stream_response: {str(e)}")
+            yield f"Error generating response: {str(e)}"
     
     async def generate_summary(self, text: str, max_length: int = 200, **kwargs) -> str:
         """
@@ -913,176 +883,3 @@ class LLMService:
         if summary and not any(summary.endswith(p) for p in ['.', '!', '?']):
             summary += '.'
         return summary if summary else "Unable to generate summary."
-    
-    async def stream_response(
-        self,
-        prompt: str,
-        max_length: int = 1000,
-        **generation_params
-    ) -> AsyncGenerator[str, None]:
-        """
-        Stream the model's response token by token.
-        
-        Args:
-            prompt: The input prompt
-            max_length: Maximum length of the generated response
-            **generation_params: Additional generation parameters
-            
-        Yields:
-            str: The next token in the generated response
-        """
-        try:
-            if not self.model or not self.tokenizer:
-                raise ValueError("Model or tokenizer not loaded. Call load_model() first.")
-                
-            # Tokenize the input
-            inputs = self.tokenizer(
-                prompt,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512
-            ).to(self.device)
-            
-            # Set default generation parameters if not provided
-            if 'max_length' not in generation_params:
-                generation_params['max_length'] = max_length
-            if 'temperature' not in generation_params:
-                generation_params['temperature'] = 0.7
-            if 'top_p' not in generation_params:
-                generation_params['top_p'] = 0.9
-                
-            # Generate tokens one by one
-            with torch.no_grad():
-                for output in self.model.generate(
-                    **inputs,
-                    max_new_tokens=generation_params.get('max_length', max_length),
-                    temperature=generation_params.get('temperature'),
-                    top_p=generation_params.get('top_p'),
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    **{k: v for k, v in generation_params.items() 
-                       if k not in ['max_length', 'temperature', 'top_p', 'do_sample']}
-                ):
-                    # Decode the new tokens
-                    new_text = self.tokenizer.decode(output[0], skip_special_tokens=True)
-                    # Skip the prompt in the first chunk
-                    if len(new_text) <= len(prompt):
-                        continue
-                    # Yield only the new text
-                    yield new_text[len(prompt):]
-                    
-        except Exception as e:
-            logger.error(f"Error in stream_response: {str(e)}")
-            yield f"Error generating response: {str(e)}"
-    
-    async def generate_response(
-        self,
-        messages: List[Dict[str, str]],
-        temperature: float = 0.7,
-        max_tokens: int = 500,
-        stream: bool = False
-    ) -> Dict[str, Any]:
-        """
-        Generate a response to a list of chat messages.
-        
-        Args:
-            messages: List of message dictionaries with 'role' and 'content' keys
-            temperature: Sampling temperature (0.0 to 2.0)
-            max_tokens: Maximum number of tokens to generate
-            stream: Whether to stream the response
-            
-        Returns:
-            Dictionary containing the response and usage information
-        """
-        try:
-            if not self.model or not self.tokenizer:
-                raise ValueError("Model or tokenizer not loaded. Call load_model() first.")
-            
-            # Format messages for the model
-            formatted_prompt = self._format_chat_messages(messages)
-            
-            # Generate response
-            inputs = self.tokenizer(
-                formatted_prompt,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=2048
-            ).to(self.device)
-            
-            # Generate response
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_length=max_tokens,
-                    temperature=temperature,
-                    top_p=0.9,
-                    do_sample=True,
-                    num_return_sequences=1,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    return_dict_in_generate=True,
-                    output_scores=True
-                )
-            
-            # Decode the response
-            response_text = self.tokenizer.decode(
-                outputs.sequences[0], 
-                skip_special_tokens=True
-            )
-            
-            # Remove the prompt from the response if it's included
-            if response_text.startswith(formatted_prompt):
-                response_text = response_text[len(formatted_prompt):].strip()
-            
-            # Calculate token usage
-            prompt_tokens = inputs.input_ids.shape[1]
-            completion_tokens = len(outputs.sequences[0])
-            
-            return {
-                "content": response_text,
-                "usage": {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": prompt_tokens + completion_tokens
-                }
-            }
-            
-        except Exception as e:
-            logger.error(f"Error in generate_response: {str(e)}", exc_info=True)
-            raise
-    
-    def _format_chat_messages(self, messages: List[Dict[str, str]]) -> str:
-        """
-        Format chat messages into a single prompt string.
-        
-        Args:
-            messages: List of message dictionaries with 'role' and 'content' keys
-            
-        Returns:
-            Formatted prompt string
-        """
-        formatted_messages = []
-        
-        for msg in messages:
-            role = msg.get('role', 'user').lower()
-            content = msg.get('content', '').strip()
-            
-            if not content:
-                continue
-                
-            if role == 'system':
-                formatted_messages.append(f"System: {content}")
-            elif role == 'user':
-                formatted_messages.append(f"User: {content}")
-            elif role == 'assistant':
-                formatted_messages.append(f"Assistant: {content}")
-            else:
-                formatted_messages.append(f"{role.capitalize()}: {content}")
-        
-        # Join messages with double newlines and add a final assistant prefix
-        prompt = "\n\n".join(formatted_messages)
-        if not prompt.strip().endswith("Assistant:"):
-            prompt += "\n\nAssistant:"
-            
-        return prompt

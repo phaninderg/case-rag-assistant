@@ -1,5 +1,6 @@
 import json
 import logging
+import asyncio
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union, AsyncGenerator
@@ -351,7 +352,8 @@ class CaseService:
         self,
         query: str,
         k: int = 5,
-        min_score: float = 0.5,  # Lowered default min_score
+        min_score: float = 0.5,
+        timeout: float = 10.0,
         **kwargs
     ) -> List[Dict[str, Any]]:
         """
@@ -361,22 +363,38 @@ class CaseService:
             query: The search query
             k: Number of results to return
             min_score: Minimum similarity score (0-1)
+            timeout: Maximum time in seconds to wait for search to complete
             **kwargs: Additional search parameters
             
         Returns:
             List of Document objects with metadata and scores
         """
         try:
-            logger.info(f"Searching for cases similar to: '{query}'")
+            import asyncio
+            logger.info(f"Searching for cases similar to: '{query}' with k={k}, min_score={min_score}")
             
-            # First try with the original query
-            results = await self._search_with_embedding(query, k, min_score, **kwargs)
+            # Run the search with timeout
+            try:
+                results = await asyncio.wait_for(
+                    self._search_with_embedding(query, k, min_score, **kwargs),
+                    timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"Vector search timed out after {timeout} seconds")
+                return []
             
             # If no results, try with a simpler query
             if not results and len(query.split()) > 2:
                 logger.info("No results found, trying with simplified query...")
                 simple_query = " ".join(query.split()[:2])  # Use first two words
-                results = await self._search_with_embedding(simple_query, k, min_score, **kwargs)
+                try:
+                    results = await asyncio.wait_for(
+                        self._search_with_embedding(simple_query, k, min_score, **kwargs),
+                        timeout=timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"Simplified query search timed out after {timeout} seconds")
+                    return []
             
             logger.info(f"Found {len(results)} similar cases")
             return results
@@ -390,16 +408,23 @@ class CaseService:
         try:
             logger.info(f"Starting search for query: '{query}' with k={k}, min_score={min_score}")
             
-            # Get the query embedding
+            # Get the query embedding with error handling
             try:
                 if hasattr(self.embedding_service.embeddings, 'embed_query'):
                     logger.debug("Using embed_query for embedding generation")
-                    query_embedding = self.embedding_service.embeddings.embed_query(query)
+                    query_embedding = await asyncio.get_event_loop().run_in_executor(
+                        None,  # Uses default ThreadPoolExecutor
+                        self.embedding_service.embeddings.embed_query,
+                        query
+                    )
                 elif hasattr(self.embedding_service.embeddings, 'encode'):
                     logger.debug("Using encode for embedding generation")
-                    query_embedding = self.embedding_service.embeddings.encode(
-                        query,
-                        convert_to_tensor=False
+                    query_embedding = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self.embedding_service.embeddings.encode(
+                            query,
+                            convert_to_tensor=False
+                        )
                     )
                 else:
                     error_msg = "Embedding model doesn't support embed_query or encode methods"
@@ -410,62 +435,64 @@ class CaseService:
                     query_embedding = query_embedding.tolist()
                 
                 logger.debug(f"Generated query embedding of length: {len(query_embedding) if query_embedding else 0}")
-                if query_embedding and len(query_embedding) > 0:
-                    logger.debug(f"First few values: {query_embedding[:3]}...")
                 
             except Exception as e:
                 logger.error(f"Error generating embedding: {str(e)}", exc_info=True)
                 return []
             
-            # Get the collection directly
+            # Get the collection and perform search with error handling
             try:
                 collection = self.embedding_service.vector_store._collection
-                logger.debug(f"Collection info - Name: {collection.name}, Count: {collection.count()}")
+                if not collection:
+                    logger.error("Failed to get collection from vector store")
+                    return []
                 
-                # Query the collection with the pre-computed embedding
-                logger.debug("Querying collection...")
-                query_results = collection.query(
-                    query_embeddings=[query_embedding],
-                    n_results=min(k * 2, 20),  # Get more results to filter by score
-                    include=["metadatas", "documents", "distances"],
-                    **kwargs
+                logger.debug(f"Querying collection with {k} results...")
+                
+                # Perform the search with a timeout
+                query_results = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: collection.query(
+                        query_embeddings=[query_embedding],
+                        n_results=min(k * 2, 20),  # Get more results to filter by score
+                        include=["metadatas", "documents", "distances"],
+                        **kwargs
+                    )
                 )
                 
-                logger.debug(f"Query results keys: {query_results.keys() if query_results else 'None'}")
-                if query_results and 'ids' in query_results:
-                    logger.debug(f"Found {len(query_results['ids'][0])} results before filtering")
+                if not query_results or 'ids' not in query_results or not query_results['ids'][0]:
+                    logger.debug("No results found in query")
+                    return []
                 
                 # Process results
                 formatted_results = []
-                if query_results and 'ids' in query_results and query_results['ids'][0]:
-                    for i in range(len(query_results['ids'][0])):
-                        try:
-                            doc_id = query_results['ids'][0][i]
-                            doc_metadata = query_results['metadatas'][0][i] if query_results.get('metadatas') and query_results['metadatas'][0] else {}
-                            doc_content = query_results['documents'][0][i] if query_results.get('documents') and query_results['documents'][0] else ""
-                            distance = query_results['distances'][0][i] if query_results.get('distances') and query_results['distances'][0] else 1.0
+                for i in range(len(query_results['ids'][0])):
+                    try:
+                        doc_id = query_results['ids'][0][i]
+                        doc_metadata = query_results['metadatas'][0][i] if query_results.get('metadatas') and query_results['metadatas'][0] else {}
+                        doc_content = query_results['documents'][0][i] if query_results.get('documents') and query_results['documents'][0] else ""
+                        distance = query_results['distances'][0][i] if query_results.get('distances') and query_results['distances'][0] else 1.0
+                        
+                        # Convert distance to similarity score (assuming cosine similarity)
+                        similarity = (1.0 + (1.0 - distance)) / 2.0
+                        
+                        logger.debug(f"Result {i+1} - ID: {doc_id}, Distance: {distance:.4f}, Similarity: {similarity:.4f}")
+                        
+                        if similarity >= min_score:
+                            result = {
+                                "content": doc_content,
+                                "metadata": doc_metadata,
+                                "score": similarity,
+                                "id": doc_id
+                            }
+                            formatted_results.append(result)
+                            logger.debug(f"Added result with score: {similarity:.4f}")
+                        else:
+                            logger.debug(f"Skipped result with score below threshold: {similarity:.4f} < {min_score}")
                             
-                            # Convert distance to similarity score (assuming cosine similarity)
-                            # For cosine similarity, the range is [-1, 1], so we normalize to [0, 1]
-                            similarity = (1.0 + (1.0 - distance)) / 2.0
-                            
-                            logger.debug(f"Result {i+1} - ID: {doc_id}, Distance: {distance:.4f}, Similarity: {similarity:.4f}")
-                            
-                            if similarity >= min_score:
-                                result = {
-                                    "content": doc_content,
-                                    "metadata": doc_metadata,
-                                    "score": similarity,
-                                    "id": doc_id
-                                }
-                                formatted_results.append(result)
-                                logger.debug(f"Added result with score: {similarity:.4f}")
-                            else:
-                                logger.debug(f"Skipped result with score below threshold: {similarity:.4f} < {min_score}")
-                                
-                        except Exception as e:
-                            logger.error(f"Error processing result {i}: {str(e)}", exc_info=True)
-                            continue
+                    except Exception as e:
+                        logger.error(f"Error processing result {i}: {str(e)}", exc_info=True)
+                        continue
                 
                 # Sort by score and limit to k results
                 formatted_results.sort(key=lambda x: x['score'], reverse=True)

@@ -14,30 +14,60 @@ import json
 import pandas as pd
 
 from src.config.settings import settings
+from src.config.models import DEFAULT_LLM
 
 logger = logging.getLogger(__name__)
 
 class TrainingService:
-    def __init__(self, base_model: str = "distilgpt2", llm_service=None):
+    def __init__(self, base_model: str = None, llm_service=None):
         """
         Initialize the training service.
         
         Args:
-            base_model: Base model name or path to fine-tune
+            base_model: Base model name or path to fine-tune. Defaults to 'llama3-8b'
             llm_service: Optional LLMService instance for inference during training
         """
-        self.base_model = base_model
+        self.base_model = base_model or DEFAULT_LLM
         self.llm_service = llm_service
         self.device = self._get_device()
-        logger.info(f"Using device: {self.device}")
-        self.tokenizer = AutoTokenizer.from_pretrained(base_model)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer = None
         self.model = None
+        logger.info(f"Initialized TrainingService with base model: {self.base_model}")
     
     def _get_device(self):
-        """Force CPU usage for stability."""
-        logger.info("Forcing CPU usage for training stability")
+        """Get the appropriate device for training."""
+        if torch.cuda.is_available():
+            return "cuda"
+        elif torch.backends.mps.is_available():
+            return "mps"
         return "cpu"
+    
+    def _load_model(self):
+        """Lazily load the model and tokenizer."""
+        if self.model is None or self.tokenizer is None:
+            logger.info(f"Loading tokenizer and model for {self.base_model}")
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.base_model,
+                    trust_remote_code=True
+                )
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+                
+                # Use bfloat16 if available for faster training
+                torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+                
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.base_model,
+                    torch_dtype=torch_dtype,
+                    device_map="auto",
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True
+                )
+                logger.info(f"Model loaded on device: {self.model.device}")
+                
+            except Exception as e:
+                logger.error(f"Failed to load model {self.base_model}: {str(e)}")
+                raise
     
     def prepare_training_data(self, cases: List[Dict[str, Any]]) -> Dataset:
         """Prepare case task data for instruction fine-tuning using the new fields."""
@@ -148,12 +178,8 @@ class TrainingService:
                 remove_columns=dataset.column_names
             )
             
-            # Initialize model if not already loaded
-            if self.model is None:
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.base_model,
-                    torch_dtype=torch.float32
-                ).to(self.device)
+            # Load model if not already loaded
+            self._load_model()
             
             # Training arguments
             training_args = TrainingArguments(

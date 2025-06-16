@@ -60,32 +60,50 @@ DEFAULT_EMBEDDING_MODELS = {
 }
 
 DEFAULT_LLM_MODELS = {
-    "tinyllama": LLMConfig(
-        name="tinyllama",
+    "llama3-8b": LLMConfig(
+        name="llama3-8b",
         provider=ModelProvider.HUGGINGFACE,
-        model_id="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        context_length=256,      # Much smaller context length
-        max_new_tokens=50,      # Keep responses short
-        temperature=0.2,        # Lower temperature for more focused responses
+        model_id="meta-llama/Llama-3.1-8B",
+        context_length=8192,
+        max_new_tokens=1024,
+        temperature=0.7,
         top_p=0.9,
-        top_k=40,
+        top_k=50,
         repetition_penalty=1.1,
         model_kwargs={
             "device_map": "auto",
-            "torch_dtype": torch.float32,  # Use float32 for CPU compatibility
+            "torch_dtype": torch.bfloat16 if torch.cuda.is_available() else torch.float32,
             "trust_remote_code": True,
             "low_cpu_mem_usage": True,
         }
     ),
+    "tinyllama": LLMConfig(
+        name="tinyllama",
+        provider=ModelProvider.HUGGINGFACE,
+        model_id="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        context_length=2048,
+        max_new_tokens=512,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=50,
+        repetition_penalty=1.1,
+        model_kwargs={
+            "device_map": "auto",
+            "torch_dtype": torch.float32,
+            "trust_remote_code": True,
+            "low_cpu_mem_usage": True,
+        }
+    ),
+    # Keep distilgpt2 as fallback for compatibility
     "distilgpt2": LLMConfig(
         name="distilgpt2",
         provider=ModelProvider.HUGGINGFACE,
         model_id="distilgpt2",
-        context_length=256,
-        max_new_tokens=50,
-        temperature=0.2,
+        context_length=1024,
+        max_new_tokens=200,
+        temperature=0.7,
         top_p=0.9,
-        top_k=40,
+        top_k=50,
         repetition_penalty=1.1,
         model_kwargs={
             "device_map": "auto",
@@ -96,8 +114,12 @@ DEFAULT_LLM_MODELS = {
     )
 }
 
+# Set default models
+DEFAULT_LLM = "llama3-8b"
+DEFAULT_EMBEDDING = "all-mpnet-base-v2"
+
 def get_model_config(model_name: str, model_type: ModelType) -> ModelConfig:
     """Get model configuration by name and type."""
     if model_type == ModelType.EMBEDDING:
         return DEFAULT_EMBEDDING_MODELS.get(model_name, DEFAULT_EMBEDDING_MODELS["all-mpnet-base-v2"])
-    return DEFAULT_LLM_MODELS.get(model_name, DEFAULT_LLM_MODELS["tinyllama"])  # Default to tinyllama
+    return DEFAULT_LLM_MODELS.get(model_name, DEFAULT_LLM_MODELS["llama3-8b"])  # Default to llama3-8b

@@ -43,8 +43,17 @@ app.add_middleware(
 # Initialize services
 case_service = CaseService()
 llm_service = LLMService(case_service=case_service)
-case_service.llm_service = llm_service  # Set up circular dependency if needed
-training_service = TrainingService()
+case_service.llm_service = llm_service  # Set up circular dependency
+
+# Initialize training service with lazy loading
+_training_service = None
+def get_training_service():
+    global _training_service
+    if _training_service is None:
+        from src.config.models import DEFAULT_LLM
+        _training_service = TrainingService(base_model=DEFAULT_LLM, llm_service=llm_service)
+        logger.info(f"Initialized training service with model: {DEFAULT_LLM}")
+    return _training_service
 
 # Request/Response Models
 # In src/app.py
@@ -82,15 +91,16 @@ class CaseSearchRequest(BaseModel):
     model_path: Optional[str] = Field(None, description="Optional path to a local model")
 
 class SearchResult(BaseModel):
-    solution: str = Field(..., description="The generated solution text")
+    solution: str = Field(..., description="The generated solution text or case content")
     similarity_score: float = Field(..., ge=0.0, le=1.0, description="Similarity score between query and result (0-1)")
     case_number: str = Field(..., description="The case number for reference")
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Additional case metadata")
 
 class SearchResponse(BaseModel):
-    results: List[SearchResult]
-    query: str
-    total_results: int
-    metadata: Dict[str, Any] = {}
+    results: List[SearchResult] = Field(default_factory=list, description="List of search results")
+    query: str = Field(..., description="The original search query")
+    total_results: int = Field(0, description="Total number of results found")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata about the search")
 
 class CaseSummaryRequest(BaseModel):
     model_name: Optional[str] = None
@@ -121,6 +131,24 @@ class TrainRequest(BaseModel):
     output_dir: str = "./trained_models/case_model"
     epochs: int = 3
     learning_rate: float = 2e-5
+
+class ChatMessage(BaseModel):
+    role: str  # 'system', 'user', or 'assistant'
+    content: str
+
+class ChatRequest(BaseModel):
+    messages: List[ChatMessage]
+    temperature: float = 0.7
+    max_tokens: int = 1000
+    stream: bool = False
+
+class ChatResponse(BaseModel):
+    message: ChatMessage
+    usage: Dict[str, int] = {
+        'prompt_tokens': 0,
+        'completion_tokens': 0,
+        'total_tokens': 0
+    }
 
 # API Endpoints
 @app.post("/api/cases", response_model=CaseResponse, status_code=status.HTTP_201_CREATED)
@@ -347,6 +375,7 @@ async def train_model(
         cases = df.to_dict('records')
         
         # Train the model
+        training_service = get_training_service()
         output_path = training_service.train(
             cases=cases,
             output_dir=request.output_dir,
@@ -388,6 +417,7 @@ async def load_trained_model(
             )
             
         # Load the model using the LLMService
+        training_service = get_training_service()
         training_service.load_trained_model(model_path)
         llm_service.load_model(model_path)
         
@@ -433,6 +463,7 @@ async def train_model(
         cases = df.to_dict('records')
         
         # Train the model
+        training_service = get_training_service()
         output_path = training_service.train(
             cases=cases,
             output_dir=output_dir,
@@ -452,6 +483,58 @@ async def train_model(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Training failed: {str(e)}"
+        )
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
+    """
+    Handle chat completion requests with the LLM.
+    """
+    logger.info("Chat endpoint called")
+    try:
+        # Log the incoming request
+        logger.info(f"Received chat request with {len(request.messages)} messages")
+        for i, msg in enumerate(request.messages):
+            logger.debug(f"Message {i + 1}: {msg.role} - {msg.content[:100]}{'...' if len(msg.content) > 100 else ''}")
+        
+        # Convert messages to the format expected by the LLM service
+        messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+        
+        logger.info(f"Calling LLM service with temperature={request.temperature}, max_tokens={request.max_tokens}")
+        
+        # Generate response using the LLM service
+        response = await llm_service.generate_response(
+            messages=messages,
+            temperature=request.temperature,
+            max_length=request.max_tokens,
+            stream=request.stream
+        )
+        
+        logger.info("Successfully generated response from LLM")
+        logger.debug(f"Response content: {response.get('content', '')[:200]}...")
+        
+        # Format the response
+        result = {
+            "message": {
+                "role": "assistant",
+                "content": response.get('content', '')
+            },
+            "usage": response.get('usage', {
+                'prompt_tokens': 0,
+                'completion_tokens': 0,
+                'total_tokens': 0
+            })
+        }
+        
+        logger.info(f"Returning response with {len(result['message']['content'])} characters")
+        return result
+        
+    except Exception as e:
+        error_msg = f"Chat error: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error generating chat response: {str(e)}"
         )
 
 # Error handlers
