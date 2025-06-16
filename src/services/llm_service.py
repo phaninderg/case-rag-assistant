@@ -263,55 +263,47 @@ class LLMService:
                             resolution = resolution or content_fields.get('resolution', '').strip()
                             steps_support = steps_support or content_fields.get('steps_support', '').strip()
                         
-                        # Check if we have resolution or steps_support to generate a solution
-                        if not resolution and not steps_support:
-                            solution_text = "No resolution or support steps found for this case, cannot propose a solution."
-                        else:
-                            try:
-                                # Use resolution and steps_support as the basis for the solution
-                                prompt = (
-                                    "### Case Information ###\n"
-                                    f"Case Number: {case_number}\n"
-                                    f"Parent Case: {parent_case if parent_case else 'None'}\n"
-                                    f"Tags: {case_task_tags if case_task_tags else 'None'}\n\n"
-                                    "### Issue Description ###\n"
-                                    f"{issue if issue else 'No issue description'}\n\n"
-                                    "### Root Cause ###\n"
-                                    f"{root_cause if root_cause else 'No root cause provided'}\n\n"
-                                    "### Resolution Details ###\n"
-                                    f"{resolution if resolution else 'No resolution details provided'}\n\n"
-                                    "### Support Steps ###\n"
-                                    f"{steps_support if steps_support else 'No support steps provided'}\n\n"
-                                    "### Your Task ###\n"
-                                    "Based on the above case details, provide a clear and concise solution summary. "
-                                    "Focus on the key resolution steps and final outcome. If resolution is missing, use the support steps.\n\n"
-                                    "### Solution Summary ###\n"
-                                )
-                                
-                                solution_text = await self.generate_response(
-                                    prompt=prompt,
-                                    max_length=500,
-                                    temperature=0.3,  # Lower temperature for more factual responses
-                                    top_p=0.9,
-                                    do_sample=True,
-                                    max_new_tokens=300
-                                )
-                                
-                                # Clean up the response
-                                solution_text = solution_text.strip()
-                                
-                                # Remove any remaining prompt artifacts
-                                for marker in ["### Solution Summary ###", "Solution:", "SOLUTION:"]:
-                                    if marker in solution_text:
-                                        solution_text = solution_text.split(marker, 1)[-1].strip()
-                                
-                                # Ensure we have a valid solution
-                                if not solution_text or solution_text.isspace() or len(solution_text) < 10:
-                                    solution_text = "No detailed solution could be generated from the resolution."
-                                
-                            except Exception as e:
-                                logger.error(f"Error generating solution: {str(e)}", exc_info=True)
-                                solution_text = "Error generating solution from resolution."
+                        # Use resolution and steps_support as the basis for the solution
+                        prompt = (
+                            "Based on the following case details, provide a concise 2-3 sentence solution summary. "
+                            "Focus on the key resolution steps and final outcome.\n\n"
+                            "### Case Information ###\n"
+                            f"Case Number: {case_number}\n"
+                            f"Parent Case: {parent_case if parent_case else 'None'}\n"
+                            "### Issue Description ###\n"
+                            f"{issue if issue else 'No issue description'}\n\n"
+                            "### Root Cause ###\n"
+                            f"{root_cause if root_cause else 'No root cause provided'}\n\n"
+                            "### Resolution Details ###\n"
+                            f"{resolution if resolution else 'No resolution details provided'}\n\n"
+                            "### Support Steps ###\n"
+                            f"{steps_support if steps_support else 'No support steps provided'}"
+                        )
+                        
+                        try:
+                            response = await self.generate_response(
+                                messages=[
+                                    {"role": "system", "content": "You are a technical support assistant that provides clear, concise solutions based on case details. Only include the solution text, no headers or formatting."},
+                                    {"role": "user", "content": prompt}
+                                ],
+                                temperature=0.3,
+                                max_tokens=300,
+                                stream=False
+                            )
+                            
+                            # Extract and clean the response
+                            solution_text = response.get('content', '').strip()
+                            
+                            # Clean up any remaining artifacts
+                            solution_text = solution_text.replace('"', '').strip()
+                            
+                            # Ensure we have a valid response
+                            if not solution_text or len(solution_text.split()) < 3:
+                                solution_text = "No detailed solution could be generated from the case details."
+                            
+                        except Exception as e:
+                            logger.error(f"Error generating solution: {str(e)}", exc_info=True)
+                            solution_text = "Error generating solution from case details."
                     
                     # Add to results
                     solutions.append({
@@ -983,3 +975,114 @@ class LLMService:
         except Exception as e:
             logger.error(f"Error in stream_response: {str(e)}")
             yield f"Error generating response: {str(e)}"
+    
+    async def generate_response(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.7,
+        max_tokens: int = 500,
+        stream: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Generate a response to a list of chat messages.
+        
+        Args:
+            messages: List of message dictionaries with 'role' and 'content' keys
+            temperature: Sampling temperature (0.0 to 2.0)
+            max_tokens: Maximum number of tokens to generate
+            stream: Whether to stream the response
+            
+        Returns:
+            Dictionary containing the response and usage information
+        """
+        try:
+            if not self.model or not self.tokenizer:
+                raise ValueError("Model or tokenizer not loaded. Call load_model() first.")
+            
+            # Format messages for the model
+            formatted_prompt = self._format_chat_messages(messages)
+            
+            # Generate response
+            inputs = self.tokenizer(
+                formatted_prompt,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=2048
+            ).to(self.device)
+            
+            # Generate response
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_length=max_tokens,
+                    temperature=temperature,
+                    top_p=0.9,
+                    do_sample=True,
+                    num_return_sequences=1,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    return_dict_in_generate=True,
+                    output_scores=True
+                )
+            
+            # Decode the response
+            response_text = self.tokenizer.decode(
+                outputs.sequences[0], 
+                skip_special_tokens=True
+            )
+            
+            # Remove the prompt from the response if it's included
+            if response_text.startswith(formatted_prompt):
+                response_text = response_text[len(formatted_prompt):].strip()
+            
+            # Calculate token usage
+            prompt_tokens = inputs.input_ids.shape[1]
+            completion_tokens = len(outputs.sequences[0])
+            
+            return {
+                "content": response_text,
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in generate_response: {str(e)}", exc_info=True)
+            raise
+    
+    def _format_chat_messages(self, messages: List[Dict[str, str]]) -> str:
+        """
+        Format chat messages into a single prompt string.
+        
+        Args:
+            messages: List of message dictionaries with 'role' and 'content' keys
+            
+        Returns:
+            Formatted prompt string
+        """
+        formatted_messages = []
+        
+        for msg in messages:
+            role = msg.get('role', 'user').lower()
+            content = msg.get('content', '').strip()
+            
+            if not content:
+                continue
+                
+            if role == 'system':
+                formatted_messages.append(f"System: {content}")
+            elif role == 'user':
+                formatted_messages.append(f"User: {content}")
+            elif role == 'assistant':
+                formatted_messages.append(f"Assistant: {content}")
+            else:
+                formatted_messages.append(f"{role.capitalize()}: {content}")
+        
+        # Join messages with double newlines and add a final assistant prefix
+        prompt = "\n\n".join(formatted_messages)
+        if not prompt.strip().endswith("Assistant:"):
+            prompt += "\n\nAssistant:"
+            
+        return prompt
