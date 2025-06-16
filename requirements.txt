@@ -3,57 +3,57 @@ fastapi==0.95.2  # Version required by chromadb
 uvicorn[standard]==0.22.0  # Compatible with fastapi 0.95.2
 python-dotenv==1.0.0
 pydantic==1.10.12  # Compatible with fastapi 0.95.2
-PyYAML==6.0  # Using a newer version with pre-built wheels
 python-multipart==0.0.6
 aiofiles==23.1.0
 
+# PyTorch (install first with appropriate CUDA version if needed)
+# For Apple Silicon (M1/M2/M3/M4):
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
+
+# For CUDA 11.8:
+# torch>=2.1.0 --index-url https://download.pytorch.org/whl/cu118
+# torchvision>=0.16.0 --index-url https://download.pytorch.org/whl/cu118
+# torchaudio>=2.1.0 --index-url https://download.pytorch.org/whl/cu118
+
 # Data processing
-numpy==1.24.3
-pandas==2.0.3
-scikit-learn==1.2.2
+numpy>=1.24.3
+pandas>=2.0.3
+scikit-learn>=1.2.2
+
+# System utilities
+psutil>=5.9.0  # For memory monitoring
 
 # Authentication & Security
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 python-magic==0.4.27
 
-# Web crawling and processing
-beautifulsoup4==4.12.2
-requests==2.31.0
-selenium==4.15.2
-undetected-chromedriver==3.5.4
-webdriver-manager==4.0.1
-newspaper3k==0.2.8  # Keep this first as it's more flexible with lxml
-trafilatura==1.6.2  # This requires lxml 4.9.2 on macOS
-lxml==4.9.2  # Specific version for trafilatura compatibility
-python-slugify==8.0.1
+# Web requests (kept for API calls)
+requests>=2.31.0
 urllib3==1.26.16
 
 # LLM and Embedding Providers
-openai>=1.0.0
-huggingface-hub==0.16.4  # Specific version that works with transformers
-transformers==4.30.2  # Specific version that works with huggingface-hub
-sentence-transformers==2.2.2  # Specific version that works with both
-safetensors>=0.3.1
+transformers>=4.36.0
 accelerate>=0.25.0
-bitsandbytes>=0.39.0
-ctransformers>=0.2.27
-llama-cpp-python>=0.1.78
-datasets==2.14.5  # Specific version for compatibility
+bitsandbytes>=0.41.0  # For 4/8-bit quantization
+sentence-transformers>=2.2.2
+safetensors>=0.3.1
+huggingface-hub>=0.16.4
+tokenizers>=0.13.2
+
+# Quantization and optimization
+optimum>=1.14.0
+auto-gptq>=0.5.0; sys_platform != 'darwin'  # Not available on macOS
 
 # Vector Stores and RAG
 langchain==0.0.267  # Updated to a version compatible with pydantic v1
 chromadb==0.4.15  # Updated to a version that works with newer FastAPI
-faiss-cpu==1.7.4
-
-# PyTorch (CPU-only version for compatibility)
-torch>=2.0.0,<3.0.0 --index-url https://download.pytorch.org/whl/cpu
-torchvision>=0.15.2,<0.16.0 --index-url https://download.pytorch.org/whl/cpu
-torchaudio>=2.0.2,<2.1.0 --index-url https://download.pytorch.org/whl/cpu
+faiss-cpu==1.7.4  # Use faiss-gpu if you have CUDA
 
 # Additional dependencies
-tokenizers==0.13.3
-tqdm==4.65.0
+tqdm>=4.65.0
 
 # Development dependencies
 pytest==7.3.1

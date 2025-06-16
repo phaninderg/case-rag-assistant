@@ -8,6 +8,8 @@ import json
 import uuid
 from datetime import datetime
 from pathlib import Path
+import pandas as pd
+import io
 
 # Update imports to use absolute paths
 from src.config.settings import settings
@@ -41,18 +43,37 @@ app.add_middleware(
 # Initialize services
 case_service = CaseService()
 llm_service = LLMService(case_service=case_service)
-case_service.llm_service = llm_service  # Set up circular dependency if needed
-training_service = TrainingService()
+case_service.llm_service = llm_service  # Set up circular dependency
+
+# Initialize training service with lazy loading
+_training_service = None
+def get_training_service():
+    global _training_service
+    if _training_service is None:
+        from src.config.models import DEFAULT_LLM
+        _training_service = TrainingService(base_model=DEFAULT_LLM, llm_service=llm_service)
+        logger.info(f"Initialized training service with model: {DEFAULT_LLM}")
+    return _training_service
 
 # Request/Response Models
+# In src/app.py
 class CaseCreate(BaseModel):
-    subject: str = Field(..., min_length=3, max_length=200)
-    description: str = Field(..., min_length=10)
-    case_number: str = Field(..., min_length=1, max_length=50)
-    parent_case: Optional[str] = None
-    close_notes: Optional[str] = None
-    tags: List[str] = Field(default_factory=list)
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+    """
+    Model for creating a new case with the following fields from case_task.csv:
+    - case_task_number: Unique identifier for the case task
+    - parent_case: Reference to a parent case (optional)
+    - issue: Description of the issue
+    - root_cause: Analysis of the root cause
+    - resolution: Steps to resolve the issue
+    - steps_support: Detailed support steps taken
+    """
+    case_task_number: str = Field(..., min_length=1, max_length=50, description="Unique identifier for the case task")
+    parent_case: Optional[str] = Field(None, description="Reference to a parent case (optional)")
+    issue: str = Field(..., min_length=3, description="Description of the issue")
+    root_cause: str = Field(..., description="Analysis of the root cause")
+    resolution: str = Field(..., description="Steps to resolve the issue")
+    steps_support: str = Field(..., description="Detailed support steps taken")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
 
 class CaseResponse(CaseCreate):
     created_at: str
@@ -70,24 +91,46 @@ class CaseSearchRequest(BaseModel):
     model_path: Optional[str] = Field(None, description="Optional path to a local model")
 
 class SearchResult(BaseModel):
-    solution: str = Field(..., description="The generated solution text")
+    solution: Optional[str] = Field(None, description="The generated solution text or case content")
     similarity_score: float = Field(..., ge=0.0, le=1.0, description="Similarity score between query and result (0-1)")
     case_number: str = Field(..., description="The case number for reference")
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Additional case metadata")
 
 class SearchResponse(BaseModel):
-    results: List[SearchResult]
-    query: str
-    total_results: int
-    metadata: Dict[str, Any] = {}
+    """Response model for case search results."""
+    results: Optional[List[SearchResult]] = Field(
+        None, 
+        description="List of search results (when include_solutions is False)"
+    )
+    ai_summary: Optional[str] = Field(
+        None, 
+        description="AI-generated summary (when include_solutions is True)"
+    )
+    query: str = Field(..., description="The original search query")
+    total_results: int = Field(0, description="Total number of results found")
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict, 
+        description="Additional metadata about the search"
+    )
 
 class CaseSummaryRequest(BaseModel):
     model_name: Optional[str] = None
     model_path: Optional[str] = None
 
 class TrainModelRequest(BaseModel):
-    cases: Optional[List[Dict[str, Any]]] = None
-    cases_file: Optional[UploadFile] = None
+    """
+    Request model for training a new model.
+    
+    The CSV file should contain the following columns:
+    - issue: Description of the issue
+    - root_cause: Analysis of the root cause
+    - resolution: Steps to resolve the issue
+    - steps_support: Detailed support steps taken
+    """
+    cases_file: UploadFile = File(..., description="CSV file containing case tasks with columns: issue, root_cause, resolution, steps_support")
     output_dir: str = "./trained_models/case_model"
+    epochs: int = 3
+    learning_rate: float = 2e-5
 
 class LLMConfigUpdate(BaseModel):
     model_name: Optional[str] = None
@@ -100,18 +143,36 @@ class TrainRequest(BaseModel):
     epochs: int = 3
     learning_rate: float = 2e-5
 
+class ChatMessage(BaseModel):
+    role: str  # 'system', 'user', or 'assistant'
+    content: str
+
+class ChatRequest(BaseModel):
+    messages: List[ChatMessage]
+    temperature: float = 0.7
+    max_tokens: int = 1000
+    stream: bool = False
+
+class ChatResponse(BaseModel):
+    message: ChatMessage
+    usage: Dict[str, int] = {
+        'prompt_tokens': 0,
+        'completion_tokens': 0,
+        'total_tokens': 0
+    }
+
 # API Endpoints
 @app.post("/api/cases", response_model=CaseResponse, status_code=status.HTTP_201_CREATED)
 async def create_case(case_data: CaseCreate):
     """Create a new case."""
     try:
         case = case_service.create_case(
-            subject=case_data.subject,
-            description=case_data.description,
-            case_number=case_data.case_number,
+            case_task_number=case_data.case_task_number,
             parent_case=case_data.parent_case,
-            close_notes=case_data.close_notes,
-            tags=case_data.tags,
+            issue=case_data.issue,
+            root_cause=case_data.root_cause,
+            resolution=case_data.resolution,
+            steps_support=case_data.steps_support,
             **case_data.metadata
         )
         return case
@@ -143,29 +204,48 @@ async def search_cases(search_request: CaseSearchRequest):
     """
     Search for similar cases and provide potential solutions.
     
-    This endpoint uses semantic search to find cases similar to the query
-    and can generate AI-powered solutions for the found cases.
+    When include_solutions is True:
+    - Returns a list of case task numbers in the 'case_task_numbers' field
+    - Includes an AI-generated summary in the 'ai_summary' field
+    
+    When include_solutions is False:
+    - Returns detailed case information in the 'results' field
     """
     try:
         # Perform the search
-        results = await llm_service.search_similar_cases(
+        search_results = await llm_service.search_similar_cases(
             query=search_request.query,
             k=search_request.k,
             min_score=search_request.min_score,
             include_solutions=search_request.include_solutions
         )
         
-        return {
-            "results": results,
-            "query": search_request.query,
-            "total_results": len(results),
-            "metadata": {
-                "model": llm_service.model_name,
-                "include_solutions": search_request.include_solutions,
-                "min_score": search_request.min_score
-            }
-        }
-        
+        # Prepare response based on include_solutions flag
+        if search_request.include_solutions:
+            # For AI solutions, we expect a dict with ai_summary
+            return SearchResponse(
+                ai_summary=search_results.get("ai_summary", "No summary available."),
+                query=search_request.query,
+                total_results=search_results.get("total_results", 0),
+                metadata={
+                    "model": llm_service.model_name,
+                    "include_solutions": True,
+                    "min_score": search_request.min_score
+                }
+            )
+        else:
+            # For regular search, we expect a list of results
+            return SearchResponse(
+                results=search_results,
+                query=search_request.query,
+                total_results=len(search_results),
+                metadata={
+                    "model": llm_service.model_name,
+                    "include_solutions": False,
+                    "min_score": search_request.min_score
+                }
+            )
+            
     except Exception as e:
         logger.error(f"Search failed: {str(e)}", exc_info=True)
         raise HTTPException(
@@ -187,7 +267,7 @@ async def summarize_case(
             request = CaseSummaryRequest()
             
         summary = await case_service.generate_case_summary(
-            case_number=case_number,
+            case_task_number=case_number,  # Changed from case_number to case_task_number
             model_name=request.model_name, 
             model_path=request.model_path
         )
@@ -308,60 +388,38 @@ async def train_model(
     request: TrainModelRequest
 ):
     """
-    Train a model on case data with instruction fine-tuning.
+    Train a model on case task data with instruction fine-tuning.
     
     Args:
-        cases: List of case dictionaries containing training data
-        cases_file: JSON file containing cases (alternative to cases parameter)
+        cases_file: CSV file containing case tasks
         output_dir: Directory to save the trained model
+        epochs: Number of training epochs
+        learning_rate: Learning rate for training
     """
     try:
-        training_data = request.cases
+        # Read and parse CSV file
+        contents = await request.cases_file.read()
+        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
         
-        # If no cases provided directly, check for file upload
-        if not training_data and request.cases_file:
-            try:
-                content = await request.cases_file.read()
-                data = json.loads(content)
-                # Handle both direct cases array and metadata wrapper format
-                training_data = data.get('cases', data) if isinstance(data, dict) else data
-            except json.JSONDecodeError:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid JSON file"
-                )
-        
-        if not training_data:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No training data provided. Either 'cases' or 'cases_file' must be provided."
-            )
-        
-        # Ensure output directory exists
-        output_dir = Path(request.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # Convert DataFrame to list of dictionaries
+        cases = df.to_dict('records')
         
         # Train the model
-        result = training_service.train_model(training_data, str(output_dir))
-        
-        if result["status"] != "success":
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=result.get("message", "Training failed")
-            )
-            
-        return JSONResponse(
-            content={
-                "status": "success",
-                "message": "Model training completed successfully",
-                "model_path": result["model_path"],
-                "training_samples": len(training_data)
-            },
-            status_code=status.HTTP_200_OK
+        training_service = get_training_service()
+        output_path = training_service.train(
+            cases=cases,
+            output_dir=request.output_dir,
+            num_train_epochs=request.epochs,
+            learning_rate=request.learning_rate
         )
         
-    except HTTPException:
-        raise
+        return {
+            "status": "success",
+            "message": "Model trained successfully",
+            "model_path": output_path,
+            "training_samples": len(cases)
+        }
+        
     except Exception as e:
         logger.error(f"Training failed: {str(e)}", exc_info=True)
         raise HTTPException(
@@ -389,6 +447,7 @@ async def load_trained_model(
             )
             
         # Load the model using the LLMService
+        training_service = get_training_service()
         training_service.load_trained_model(model_path)
         llm_service.load_model(model_path)
         
@@ -408,7 +467,7 @@ async def load_trained_model(
 
 @app.post("/api/train", status_code=200)
 async def train_model(
-    cases_file: UploadFile = File(...),
+    cases_file: UploadFile = File(..., description="CSV file containing case tasks"),
     output_dir: str = Form("./trained_models/case_model"),
     epochs: int = Form(3),
     learning_rate: float = Form(2e-5)
@@ -417,7 +476,7 @@ async def train_model(
     Train a new model on the provided cases.
     
     Args:
-        cases_file: JSON file containing cases (required)
+        cases_file: CSV file containing case tasks
         output_dir: Directory to save the trained model
         epochs: Number of training epochs
         learning_rate: Learning rate for training
@@ -426,41 +485,86 @@ async def train_model(
         dict: Status and path to the trained model
     """
     try:
-        # Read and parse the uploaded file
-        content = await cases_file.read()
-        try:
-            data = json.loads(content)
-            # Handle both direct cases array and metadata wrapper format
-            training_data = data.get('cases', data) if isinstance(data, dict) else data
-            if not isinstance(training_data, list):
-                raise ValueError("Invalid file format: expected a JSON array or object with 'cases' key")
-        except json.JSONDecodeError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid JSON file"
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid training data format: {str(e)}"
-            )
-            
+        # Read and parse CSV file
+        contents = await cases_file.read()
+        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
+        
+        # Convert DataFrame to list of dictionaries
+        cases = df.to_dict('records')
+        
         # Train the model
-        output_dir = training_service.train(
-            cases=training_data,
+        training_service = get_training_service()
+        output_path = training_service.train(
+            cases=cases,
             output_dir=output_dir,
             num_train_epochs=epochs,
             learning_rate=learning_rate
         )
-        return {"status": "success", "model_path": output_dir}
         
-    except HTTPException:
-        raise
+        return {
+            "status": "success",
+            "message": "Model trained successfully",
+            "model_path": output_path,
+            "training_samples": len(cases)
+        }
+        
     except Exception as e:
         logger.error(f"Training failed: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Training failed: {str(e)}"
+        )
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
+    """
+    Handle chat completion requests with the LLM.
+    """
+    logger.info("Chat endpoint called")
+    try:
+        # Log the incoming request
+        logger.info(f"Received chat request with {len(request.messages)} messages")
+        for i, msg in enumerate(request.messages):
+            logger.debug(f"Message {i + 1}: {msg.role} - {msg.content[:100]}{'...' if len(msg.content) > 100 else ''}")
+        
+        # Convert messages to the format expected by the LLM service
+        messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+        
+        logger.info(f"Calling LLM service with temperature={request.temperature}, max_tokens={request.max_tokens}")
+        
+        # Generate response using the LLM service
+        response = await llm_service.generate_response(
+            messages=messages,
+            temperature=request.temperature,
+            max_length=request.max_tokens,
+            stream=request.stream
+        )
+        
+        logger.info("Successfully generated response from LLM")
+        logger.debug(f"Response content: {response.get('content', '')[:200]}...")
+        
+        # Format the response
+        result = {
+            "message": {
+                "role": "assistant",
+                "content": response.get('content', '')
+            },
+            "usage": response.get('usage', {
+                'prompt_tokens': 0,
+                'completion_tokens': 0,
+                'total_tokens': 0
+            })
+        }
+        
+        logger.info(f"Returning response with {len(result['message']['content'])} characters")
+        return result
+        
+    except Exception as e:
+        error_msg = f"Chat error: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error generating chat response: {str(e)}"
         )
 
 # Error handlers
