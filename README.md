@@ -5,30 +5,28 @@ A powerful Retrieval-Augmented Generation (RAG) system for case task analysis, s
 ## 🚀 Current Status
 
 ✅ **Core Features Implemented**
-- Multi-model LLM support (OpenAI, HuggingFace, LLaMA)
+- Multi-model LLM support (Gemma-2b-it, HuggingFace, LLaMA)
 - Vector-based semantic search with ChromaDB
 - Case management with metadata support
 - RESTful API with pagination and filtering
 - Asynchronous request handling
 - Configurable model parameters
-- Fine-tuning support for custom models
-- CPU-optimized training pipeline
+- CPU-optimized inference pipeline
 
 🔄 **Recent Updates**
-- Added fine-tuning capabilities for case-specific models
-- Improved tokenization and data preprocessing
-- Enhanced error handling and logging
-- CPU-optimized training pipeline for Apple Silicon
+- Upgraded to Gemma-2b-it as the default LLM
+- Enhanced tokenization and data preprocessing
+- Improved error handling and logging
+- CPU-optimized inference pipeline for Apple Silicon
 - Support for custom case data formatting
-- Integration with HuggingFace Transformers for fine-tuning
+- Integration with HuggingFace Transformers for inference
 
 ## 🛠️ Features
 
 ### Core Functionality
-- **Multi-Model Support**: Choose from various LLM providers (OpenAI, HuggingFace, LLaMA)
+- **Multi-Model Support**: Choose from various LLM providers (Gemma-2b-it, HuggingFace, LLaMA)
 - **Semantic Search**: Find similar cases using vector similarity search
 - **Case Management**: Store, retrieve, and manage case data with metadata
-- **Fine-Tuning**: Train custom models on your case data
 - **RESTful API**: Comprehensive API documentation with Swagger UI
 
 ### Technical Features
@@ -44,7 +42,7 @@ A powerful Retrieval-Augmented Generation (RAG) system for case task analysis, s
 
 - Python 3.9+
 - pip (Python package manager)
-- [Optional] For training: At least 8GB RAM recommended
+- [Optional] For inference: At least 8GB RAM recommended
 
 ### Installation
 
@@ -82,20 +80,6 @@ A powerful Retrieval-Augmented Generation (RAG) system for case task analysis, s
    - Swagger UI: http://localhost:8000/docs
    - ReDoc: http://localhost:8000/redoc
 
-### Training a Custom Model
-
-1. Prepare your case data in JSON format (see `cases.json` for example)
-
-2. Start the training process:
-   ```bash
-   curl -X 'POST' \
-     'http://localhost:8000/train' \
-     -H 'accept: application/json' \
-     -F 'cases_file=@./path/to/your/cases.json'
-   ```
-
-3. Monitor training progress in the logs
-
 ## 🧩 Project Structure
 
 ```
@@ -106,7 +90,7 @@ case-rag-assistant/
 │   ├── services/       # Core services
 │   │   ├── case_service.py    # Case management
 │   │   ├── llm_service.py     # LLM integration
-│   │   └── training_service.py # Model training
+│   │   └── embedding_service.py # Vector embeddings
 │   ├── utils/          # Utility functions
 │   └── app.py          # FastAPI application
 ├── tests/              # Test cases
@@ -121,7 +105,6 @@ case-rag-assistant/
 - `GET /api/cases` - List all cases
 - `GET /api/cases/{case_id}` - Get case details
 - `POST /api/cases/search` - Search for similar cases
-- `POST /train` - Train a new model on case data
 - `GET /models` - List available models
 
 ## 🤝 Contributing
@@ -140,8 +123,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🙏 Acknowledgments
 
+- [Google Gemma](https://ai.google.dev/gemma)
 - [HuggingFace Transformers](https://huggingface.co/transformers/)
-- [LangChain](https://python.langchain.com/)
 - [FastAPI](https://fastapi.tiangolo.com/)
 - [ChromaDB](https://www.trychroma.com/)
 
@@ -149,11 +132,11 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ### Model Selection
 
-The system supports multiple LLM and embedding models. You can switch between different models using the `model_name` parameter in the API requests.
+The system supports multiple LLM models with Gemma-2b-it as the default. You can switch between different models using the `model_name` parameter in the API requests.
 
 ### Embedding Models
 
-The system supports different embedding models for vector search. You can configure the embedding model using the `embedding_service` module.
+The system supports different embedding models for vector search. The default is set to 'all-mpnet-base-v2' for optimal performance.
 
 ```python
 # Example: Update embedding model
@@ -163,20 +146,13 @@ embedding_service.update_embedding_model(
 )
 ```
 
-### Custom Models
+### Using Gemma-2b-it
 
-You can use custom models from Hugging Face Hub or local paths.
-
-```json
-{
-  "model_name": "username/model-name"
-}
-```
+To use Gemma-2b-it as your LLM, ensure you have the necessary access and set it in your configuration:
 
 ```json
 {
-  "model_name": "custom-model",
-  "model_path": "/path/to/model"
+  "model_name": "google/gemma-2b-it"
 }
 ```
 
@@ -186,26 +162,9 @@ You can use custom models from Hugging Face Hub or local paths.
 
 ```env
 # Required
-DEFAULT_LLM=default
+DEFAULT_LLM=google/gemma-2b-it
 DEFAULT_EMBEDDING=sentence-transformers/all-mpnet-base-v2
 
 # Optional
 HUGGINGFACE_API_KEY=your-hf-token
 MODEL_CACHE_DIR=./model_cache
-```
-
-## 📦 Project Structure
-
-```
-case-rag-assistant/
-├── src/
-│   ├── config/         # Configuration files
-│   ├── models/         # Data models and embeddings
-│   ├── services/       # Core services
-│   ├── utils/          # Utility functions
-│   └── app.py          # FastAPI application
-├── trained_models/     # Saved models
-├── tests/              # Test cases
-├── requirements.txt    # Python dependencies
-└── README.md          # This file
-```

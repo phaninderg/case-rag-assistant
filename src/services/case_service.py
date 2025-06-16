@@ -28,8 +28,6 @@ from src.services.llm_service import LLMService
 logger = logging.getLogger(__name__)
 
 class CaseService:
-    # Maximum length for description in characters
-    MAX_DESCRIPTION_LENGTH = 100000
 
     def __init__(self, llm_service: Optional[LLMService] = None):
         self.llm_service = llm_service
