@@ -132,12 +132,6 @@ class TrainModelRequest(BaseModel):
     epochs: int = 3
     learning_rate: float = 2e-5
 
-class LLMConfigUpdate(BaseModel):
-    model_name: Optional[str] = None
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
-    streaming: Optional[bool] = None
-
 class TrainRequest(BaseModel):
     output_dir: str = "./trained_models/case_model"
     epochs: int = 3
@@ -313,55 +307,21 @@ async def get_vector_store_status():
             detail=f"Error getting vector store status: {str(e)}"
         )
 
-@app.post("/api/llm/config")
-async def update_llm_config(config: LLMConfigUpdate):
-    """Update the LLM configuration."""
-    try:
-        global llm_service, case_service
-        
-        # Create new LLM service with updated config
-        new_llm_service = LLMService(
-            case_service=case_service,
-            model_name=config.model_name or llm_service.model_name,
-            temperature=config.temperature if config.temperature is not None else llm_service.llm.temperature,
-            max_tokens=config.max_tokens if config.max_tokens is not None else llm_service.llm.max_tokens,
-            streaming=config.streaming if config.streaming is not None else llm_service.streaming
-        )
-        
-        # Update services
-        llm_service = new_llm_service
-        case_service.llm_service = new_llm_service
-        
-        return {
-            "status": "success",
-            "message": "LLM configuration updated",
-            "config": {
-                "model_name": llm_service.model_name,
-                "temperature": llm_service.llm.temperature,
-                "max_tokens": llm_service.llm.max_tokens,
-                "streaming": llm_service.streaming
-            }
-        }
-    except Exception as e:
-        logger.error(f"Error updating LLM config: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update LLM config: {str(e)}"
-        )
-
 @app.get("/api/models")
 async def list_available_models():
     """List all available LLM and embedding models."""
     try:
+        from src.config.models import DEFAULT_LLM_MODELS, DEFAULT_EMBEDDING_MODELS
+        
         return {
-            "llm_models": ["gpt-3.5-turbo", "gpt-4", "claude-2"],
-            "embedding_models": ["text-embedding-ada-002", "all-mpnet-base-v2"]
+            "llm_models": list(DEFAULT_LLM_MODELS.keys()),
+            "embedding_models": list(DEFAULT_EMBEDDING_MODELS.keys())
         }
     except Exception as e:
-        logger.error(f"Error listing models: {str(e)}")
+        logger.error(f"Error listing available models: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to list available models"
+            detail=f"Failed to list available models: {str(e)}"
         )
 
 @app.get("/health")
