@@ -5,46 +5,41 @@ A powerful Retrieval-Augmented Generation (RAG) system for case task analysis, s
 ## 🚀 Current Status
 
 ✅ **Core Features Implemented**
-- Multi-model LLM support (Gemma-2b-it, HuggingFace, LLaMA)
+- Multi-model LLM support (Gemma-2b-it, TinyLlama, LLaMA)
 - Vector-based semantic search with ChromaDB
 - Case management with metadata support
-- RESTful API with pagination and filtering
-- Asynchronous request handling
-- Configurable model parameters
-- CPU-optimized inference pipeline
-
-🔄 **Recent Updates**
-- Upgraded to Gemma-2b-it as the default LLM
-- Enhanced tokenization and data preprocessing
-- Improved error handling and logging
-- CPU-optimized inference pipeline for Apple Silicon
-- Support for custom case data formatting
-- Integration with HuggingFace Transformers for inference
+- RESTful API with FastAPI
+- Modern React frontend with Material-UI
+- Model training and fine-tuning capabilities
+- CPU/GPU optimized inference pipeline
 
 ## 🛠️ Features
 
-### Core Functionality
-- **Multi-Model Support**: Choose from various LLM providers (Gemma-2b-it, HuggingFace, LLaMA)
-- **Semantic Search**: Find similar cases using vector similarity search
-- **Case Management**: Store, retrieve, and manage case data with metadata
+### Backend
+- **LLM Integration**: Support for multiple models (Gemma-2b-it, TinyLlama, LLaMA)
+- **Vector Search**: Semantic search using ChromaDB
+- **Case Management**: CRUD operations for case tasks
+- **Model Training**: Fine-tune models on custom datasets
 - **RESTful API**: Comprehensive API documentation with Swagger UI
+- **Asynchronous Processing**: Efficient request handling
 
-### Technical Features
-- **CPU Optimization**: Runs efficiently on CPU-only environments
-- **Asynchronous Processing**: Efficient handling of multiple concurrent requests
-- **Flexible Storage**: Local vector store with ChromaDB
-- **Environment Configuration**: Easy setup with environment variables
-- **Comprehensive Logging**: Detailed logging for debugging and monitoring
+### Frontend
+- **Interactive UI**: Built with React and Material-UI
+- **Case Search**: Find similar cases using natural language
+- **Chat Interface**: Interactive chat with the AI assistant
+- **Responsive Design**: Works on desktop and mobile
+- **Real-time Updates**: Dynamic UI with live search results
 
 ## 🚀 Getting Started
 
 ### Prerequisites
 
 - Python 3.9+
+- Node.js 16+ (for frontend)
 - pip (Python package manager)
-- [Optional] For inference: At least 8GB RAM recommended
+- [Optional] CUDA for GPU acceleration
 
-### Installation
+### Backend Setup
 
 1. Clone the repository:
    ```bash
@@ -58,64 +53,92 @@ A powerful Retrieval-Augmented Generation (RAG) system for case task analysis, s
    source venv/bin/activate  # On Windows: venv\Scripts\activate
    ```
 
-3. Install dependencies:
+3. Install Python dependencies:
    ```bash
    pip install -r requirements.txt
    ```
 
-4. Set up environment variables:
+### Frontend Setup
+
+1. Navigate to the frontend directory:
    ```bash
-   cp .env.example .env
-   # Edit .env with your configuration
+   cd frontend
    ```
 
-### Running the Application
-
-1. Start the FastAPI server:
+2. Install Node.js dependencies:
    ```bash
-   uvicorn src.app:app --reload
+   npm install
    ```
 
-2. Access the API documentation:
-   - Swagger UI: http://localhost:8000/docs
-   - ReDoc: http://localhost:8000/redoc
+3. Start the development server:
+   ```bash
+   npm start
+   ```
 
-## 🧩 Project Structure
+## 🏗️ Project Structure
 
 ```
 case-rag-assistant/
-├── src/
-│   ├── config/         # Configuration files
-│   ├── models/         # Data models and embeddings
-│   ├── services/       # Core services
-│   │   ├── case_service.py    # Case management
+├── src/                    # Backend source code
+│   ├── config/            # Configuration files
+│   ├── models/            # Data models and database schemas
+│   ├── services/          # Core services
+│   │   ├── case_service.py    # Case management logic
 │   │   ├── llm_service.py     # LLM integration
-│   │   └── embedding_service.py # Vector embeddings
-│   ├── utils/          # Utility functions
-│   └── app.py          # FastAPI application
-├── tests/              # Test cases
-├── requirements.txt    # Python dependencies
-└── README.md          # This file
+│   │   └── training_service.py # Model training
+│   └── app.py             # FastAPI application
+├── frontend/              # React frontend
+│   ├── public/            # Static assets
+│   └── src/               # React source
+│       ├── components/    # Reusable UI components
+│       ├── services/      # API service layer
+│       └── App.tsx        # Main application component
+├── data/                  # Data storage
+│   ├── cases/             # Case data files
+│   └── vector_store/      # Embedding vectors
+├── tests/                 # Test cases
+├── sample_case_task.csv   # Sample case tasks for testing
+├── requirements.txt       # Python dependencies
+└── README.md             # This file
 ```
 
-## 📚 API Documentation
+## 📋 Sample Data
 
-### Endpoints
+A sample CSV file (`sample_case_task.csv`) is included in the root directory with example case tasks that demonstrate the expected format for training data. The file includes the following columns:
 
+- `issue`: Description of the reported problem
+- `root_cause`: Analysis of what was causing the issue
+- `resolution`: Steps taken to resolve the issue
+- `steps_support`: Detailed support steps with numbered actions
+
+You can use this file as a reference when preparing your own case task data for training or testing the system.
+
+## 📚 API Endpoints
+
+### Case Management
 - `GET /api/cases` - List all cases
+- `POST /api/cases` - Create a new case
 - `GET /api/cases/{case_id}` - Get case details
+- `PUT /api/cases/{case_id}` - Update a case
+- `DELETE /api/cases/{case_id}` - Delete a case
+
+### Search & Analysis
 - `POST /api/cases/search` - Search for similar cases
-- `GET /models` - List available models
+- `GET /api/cases/{case_id}/summary` - Generate case summary
+- `POST /api/chat` - Chat with the AI assistant
+
+### Models
+- `GET /api/models` - List available models
+- `POST /api/train` - Train/fine-tune a model
+- `POST /api/load-model` - Load a trained model
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please follow these steps:
-
 1. Fork the repository
-2. Create a new branch for your feature
-3. Commit your changes
-4. Push to the branch
-5. Create a new Pull Request
+2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
 
 ## 📄 License
 
@@ -123,48 +146,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🙏 Acknowledgments
 
-- [Google Gemma](https://ai.google.dev/gemma)
-- [HuggingFace Transformers](https://huggingface.co/transformers/)
-- [FastAPI](https://fastapi.tiangolo.com/)
-- [ChromaDB](https://www.trychroma.com/)
-
-## 🚀 Model Selection and Embedding Capabilities
-
-### Model Selection
-
-The system supports multiple LLM models with Gemma-2b-it as the default. You can switch between different models using the `model_name` parameter in the API requests.
-
-### Embedding Models
-
-The system supports different embedding models for vector search. The default is set to 'all-mpnet-base-v2' for optimal performance.
-
-```python
-# Example: Update embedding model
-embedding_service.update_embedding_model(
-    model_name="sentence-transformers/all-mpnet-base-v2",
-    model_path=None  # Optional local path
-)
-```
-
-### Using Gemma-2b-it
-
-To use Gemma-2b-it as your LLM, ensure you have the necessary access and set it in your configuration:
-
-```json
-{
-  "model_name": "google/gemma-2b-it"
-}
-```
-
-## 🔧 Configuration
-
-### Environment Variables
-
-```env
-# Required
-DEFAULT_LLM=google/gemma-2b-it
-DEFAULT_EMBEDDING=sentence-transformers/all-mpnet-base-v2
-
-# Optional
-HUGGINGFACE_API_KEY=your-hf-token
-MODEL_CACHE_DIR=./model_cache
+- [Hugging Face](https://huggingface.co/) for the Transformers library
+- [ChromaDB](https://www.trychroma.com/) for vector storage
+- [FastAPI](https://fastapi.tiangolo.com/) for the backend API
+- [React](https://reactjs.org/) and [Material-UI](https://mui.com/) for the frontend
