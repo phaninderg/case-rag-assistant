@@ -116,11 +116,8 @@ You can use this file as a reference when preparing your own case task data for 
 ## 📚 API Endpoints
 
 ### Case Management
-- `GET /api/cases` - List all cases
 - `POST /api/cases` - Create a new case
 - `GET /api/cases/{case_id}` - Get case details
-- `PUT /api/cases/{case_id}` - Update a case
-- `DELETE /api/cases/{case_id}` - Delete a case
 
 ### Search & Analysis
 - `POST /api/cases/search` - Search for similar cases
