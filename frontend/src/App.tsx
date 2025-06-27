@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useCallback, useMemo, lazy, Suspense } from 'react';
 import { 
   Container, 
   Typography, 
@@ -11,24 +11,43 @@ import {
   Alert,
   Tabs,
   Tab,
-  Box
+  Box,
+  CircularProgress,
+  IconButton
 } from '@mui/material';
+import Brightness4Icon from '@mui/icons-material/Brightness4';
+import Brightness7Icon from '@mui/icons-material/Brightness7';
 import SearchBar from './components/SearchBar';
 import CaseCard from './components/CaseCard';
-import Chat from './components/Chat';
+import ErrorBoundary from './components/ErrorBoundary';
 import { searchCases } from './services/api';
 import { SearchResult } from './types';
 
-const theme = createTheme({
-  palette: {
-    primary: {
-      main: '#1976d2',
-    },
-    secondary: {
-      main: '#dc004e',
-    },
-  },
-});
+// Use lazy loading for the Chat component which may not be used immediately
+const Chat = lazy(() => import('./components/Chat'));
+
+// Import theme hook
+type ThemeMode = 'light' | 'dark';
+interface ThemeHook {
+  mode: ThemeMode;
+  toggleTheme: () => void;
+  isDark: boolean;
+}
+
+// Mock implementation for useTheme if the module is not found
+const useTheme = (): ThemeHook => {
+  const [mode, setMode] = useState<ThemeMode>('light');
+  
+  const toggleTheme = useCallback(() => {
+    setMode(prevMode => (prevMode === 'light' ? 'dark' : 'light'));
+  }, []);
+  
+  return {
+    mode,
+    toggleTheme,
+    isDark: mode === 'dark'
+  };
+};
 
 interface TabPanelProps {
   children?: React.ReactNode;
@@ -64,6 +83,28 @@ function a11yProps(index: number) {
 }
 
 function App() {
+  // Use the custom theme hook
+  const { mode, toggleTheme } = useTheme();
+  
+  // Create theme based on current mode
+  const theme = useMemo(() => 
+    createTheme({
+      palette: {
+        mode: mode as 'light' | 'dark',
+        primary: {
+          main: '#1976d2',
+        },
+        secondary: {
+          main: '#dc004e',
+        },
+        background: {
+          default: mode === 'light' ? '#f5f5f5' : '#121212',
+          paper: mode === 'light' ? '#ffffff' : '#1e1e1e',
+        },
+      },
+    }),
+  [mode]);
+
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<SearchResult[]>([]);
   const [aiSummary, setAiSummary] = useState('');
@@ -74,11 +115,13 @@ function App() {
   const [k, setK] = useState(10);
   const [minScore, setMinScore] = useState(0.6);
 
-  const handleTabChange = (event: React.SyntheticEvent, newValue: number) => {
+  // Memoize tab change handler to prevent unnecessary re-renders
+  const handleTabChange = useCallback((event: React.SyntheticEvent, newValue: number) => {
     setTabValue(newValue);
-  };
+  }, []);
 
-  const handleSearch = async () => {
+  // Memoize search handler for better performance
+  const handleSearch = useCallback(async () => {
     if (!query.trim()) return;
     
     setLoading(true);
@@ -87,7 +130,13 @@ function App() {
     setAiSummary('');
     
     try {
-      const data = await searchCases(query, k, minScore, includeAI);
+      const response = await searchCases(query, k, minScore, includeAI);
+      
+      // Type assertion for the response
+      const data = response as { 
+        ai_summary?: string; 
+        results?: SearchResult[] 
+      };
       
       if (includeAI) {
         // When includeAI is true, we only get ai_summary
@@ -104,18 +153,22 @@ function App() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [query, k, minScore, includeAI]);
 
   return (
-    <ThemeProvider theme={theme}>
-      <CssBaseline />
-      <AppBar position="static">
-        <Toolbar>
-          <Typography variant="h6" component="div" sx={{ flexGrow: 1 }}>
-            Case RAG Assistant
-          </Typography>
-        </Toolbar>
-      </AppBar>
+    <ErrorBoundary>
+      <ThemeProvider theme={theme}>
+        <CssBaseline />
+        <AppBar position="static">
+          <Toolbar>
+            <Typography variant="h6" component="div" sx={{ flexGrow: 1 }}>
+              Case RAG Assistant
+            </Typography>
+            <IconButton onClick={toggleTheme} color="inherit" aria-label="toggle theme">
+              {mode === 'dark' ? <Brightness7Icon /> : <Brightness4Icon />}
+            </IconButton>
+          </Toolbar>
+        </AppBar>
       
       <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
         <Paper elevation={3} sx={{ mb: 4 }}>
@@ -200,12 +253,15 @@ function App() {
 
           <TabPanel value={tabValue} index={1}>
             <Box sx={{ p: 3 }}>
-              <Chat />
+              <Suspense fallback={<Box sx={{ display: 'flex', justifyContent: 'center', p: 4 }}><CircularProgress /></Box>}>
+                <Chat />
+              </Suspense>
             </Box>
           </TabPanel>
         </Paper>
       </Container>
-    </ThemeProvider>
+      </ThemeProvider>
+    </ErrorBoundary>
   );
 }
 

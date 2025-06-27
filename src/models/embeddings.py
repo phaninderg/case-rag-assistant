@@ -4,6 +4,7 @@ import logging
 import numpy as np
 from pathlib import Path
 from datetime import datetime
+import gc
 
 from langchain.vectorstores import Chroma
 from langchain.docstore.document import Document
@@ -100,7 +101,13 @@ class EmbeddingService:
             model_path: Optional path to a local model
         """
         try:
+            # Store old model reference for cleanup
+            old_embeddings = self.embeddings
+            old_vector_store = self.vector_store
+            
+            # Update model name
             self.model_name = model_name
+            
             if model_path:
                 # Load model from local path
                 self.embeddings = ModelFactory.create_embeddings({
@@ -115,6 +122,15 @@ class EmbeddingService:
             # Reinitialize the vector store with the new embeddings
             self.vector_store = self._initialize_vector_store()
             logger.info(f"Updated embedding model to {model_name}")
+            
+            # Clean up old models to free memory
+            try:
+                del old_embeddings
+                del old_vector_store
+                gc.collect()
+                logger.info("Cleaned up old embedding model resources")
+            except Exception as e:
+                logger.warning(f"Error cleaning up old embedding model: {str(e)}")
             
         except Exception as e:
             logger.error(f"Failed to update embedding model: {str(e)}")

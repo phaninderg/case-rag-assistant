@@ -1,6 +1,8 @@
 from typing import Dict, Any, Optional, List, Union
 import logging
 import torch
+import sys
+import platform
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
 from langchain.llms.base import BaseLLM
 from langchain.embeddings.base import Embeddings
@@ -10,6 +12,19 @@ from src.config.models import ModelConfig, ModelProvider, LLMConfig, EmbeddingMo
 from src.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Check if we're on macOS
+IS_MACOS = sys.platform == 'darwin' or platform.system() == 'Darwin'
+
+# Check if auto-gptq is available
+AUTO_GPTQ_AVAILABLE = False
+if not IS_MACOS:
+    try:
+        import auto_gptq
+        AUTO_GPTQ_AVAILABLE = True
+    except ImportError:
+        logger.warning("auto-gptq is not available. Some quantization features will be disabled.")
+        AUTO_GPTQ_AVAILABLE = False
 
 class ModelFactory:
     """Factory class for creating language and embedding models optimized for Apple Silicon."""
