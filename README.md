@@ -13,6 +13,22 @@ A powerful Retrieval-Augmented Generation (RAG) system for case task analysis, s
 - Model training and fine-tuning capabilities
 - CPU/GPU optimized inference pipeline
 
+## 📸 Screenshots
+
+### Frontend Interface
+![Frontend Search Interface](/docs/images/frontend-search.png)
+*The main search interface where users can query for similar cases*
+
+![Frontend Chat Interface](/docs/images/frontend-chat.png)
+*Interactive chat interface with the AI assistant*
+
+### Backend Interface
+![API Documentation](/docs/images/backend-api-docs.png)
+*FastAPI Swagger documentation showing available endpoints*
+
+![Prometheus Dashboard](/docs/images/prometheus-dashboard.png)
+*Metrics dashboard for monitoring application performance*
+
 ## 🛠️ Features
 
 ### Backend
@@ -112,16 +128,75 @@ To access gated models like Gemma, you need to set up a Hugging Face API key:
    HUGGINGFACE_API_KEY=your_actual_api_key_here
    ```
 
-2. Build and start the containers:
+2. Build the backend and frontend Docker images:
    ```bash
-   docker-compose up -d --build
+   # Build the backend image
+   docker build -t case-rag-backend .
+   
+   # Build the frontend image
+   docker build -t case-rag-frontend ./frontend
    ```
 
-3. Access the application:
+3. Create a Docker network for the application:
+   ```bash
+   docker network create case-rag-network
+   ```
+
+4. Run the backend container:
+   ```bash
+   docker run -d \
+     --name case-rag-assistant \
+     --network case-rag-network \
+     -p 8000:8000 \
+     -v $(pwd)/data:/app/data \
+     -v $(pwd)/offload:/app/offload \
+     -v ~/.cache/huggingface:/root/.cache/huggingface \
+     -e LOG_LEVEL=INFO \
+     -e HOST=0.0.0.0 \
+     -e PORT=8000 \
+     -e DATA_DIR=/app/data \
+     -e DEFAULT_LLM=google/gemma-2b-it \
+     -e DEFAULT_EMBEDDING=all-mpnet-base-v2 \
+     -e HUGGINGFACE_API_KEY=${HUGGINGFACE_API_KEY} \
+     case-rag-backend
+   ```
+
+5. Run the frontend container:
+   ```bash
+   docker run -d \
+     --name case-rag-frontend \
+     --network case-rag-network \
+     -p 3000:80 \
+     case-rag-frontend
+   ```
+
+6. Run Prometheus for monitoring (optional):
+   ```bash
+   docker run -d \
+     --name prometheus \
+     --network case-rag-network \
+     -p 9090:9090 \
+     -v $(pwd)/prometheus.yml:/etc/prometheus/prometheus.yml \
+     prom/prometheus:latest \
+     --config.file=/etc/prometheus/prometheus.yml \
+     --storage.tsdb.path=/prometheus \
+     --web.console.libraries=/usr/share/prometheus/console_libraries \
+     --web.console.templates=/usr/share/prometheus/consoles
+   ```
+
+7. Access the application:
    - Frontend UI: `http://localhost:3000`
    - Backend API: `http://localhost:8000`
    - API Documentation: `http://localhost:8000/docs`
    - Metrics Dashboard: `http://localhost:9090` (Prometheus)
+
+#### Using docker-compose (Alternative)
+
+If you prefer using docker-compose:
+
+```bash
+docker-compose up -d --build
+```
 
 #### Manual Deployment
 
