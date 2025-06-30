@@ -16,17 +16,6 @@ from src.utils.helpers import generate_id, format_timestamp
 
 logger = logging.getLogger(__name__)
 
-# In src/services/case_service.py
-from typing import Dict, List, Optional, Any
-from datetime import datetime
-import json
-import logging
-from langchain.docstore.document import Document
-from src.models.embeddings import EmbeddingService
-from src.services.llm_service import LLMService
-
-logger = logging.getLogger(__name__)
-
 class CaseService:
 
     def __init__(self, llm_service: Optional[LLMService] = None):

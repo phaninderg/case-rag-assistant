@@ -6,10 +6,14 @@ from typing import List, Optional, Dict, Any, Union
 import logging
 import json
 import uuid
+import time
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
 import io
+
+# Import Prometheus metrics
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
 # Update imports to use absolute paths
 from src.config.settings import settings
@@ -21,6 +25,14 @@ from src.services.training_service import TrainingService
 # Configure logging
 logging.basicConfig(level=settings.log_level.upper())
 logger = logging.getLogger(__name__)
+
+# Define Prometheus metrics
+REQUEST_COUNT = Counter('http_requests_total', 'Total HTTP Requests', ['method', 'endpoint', 'status'])
+REQUEST_LATENCY = Histogram('http_request_duration_seconds', 'HTTP Request Latency', ['method', 'endpoint'])
+MODEL_LOAD_TIME = Histogram('model_load_time_seconds', 'Time to load model', ['model_name'])
+SEARCH_LATENCY = Histogram('search_latency_seconds', 'Search operation latency')
+MEMORY_USAGE = Gauge('memory_usage_bytes', 'Memory usage in bytes')
+ACTIVE_REQUESTS = Gauge('active_requests', 'Number of active requests')
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -39,6 +51,34 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Add metrics middleware
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    ACTIVE_REQUESTS.inc()
+    request_path = request.url.path
+    request_method = request.method
+    
+    # Skip metrics collection for certain paths
+    if request_path == "/metrics" or request_path == "/api/health":
+        return await call_next(request)
+    
+    start_time = time.time()
+    
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        REQUEST_COUNT.labels(request_method, request_path, status_code).inc()
+        
+        # Record request latency
+        REQUEST_LATENCY.labels(request_method, request_path).observe(time.time() - start_time)
+        
+        return response
+    except Exception as e:
+        REQUEST_COUNT.labels(request_method, request_path, 500).inc()
+        raise e
+    finally:
+        ACTIVE_REQUESTS.dec()
 
 # Initialize services
 case_service = CaseService()
@@ -527,6 +567,17 @@ async def chat_endpoint(request: ChatRequest):
             detail=f"Error generating chat response: {str(e)}"
         )
 
+# Metrics endpoint
+@app.get("/metrics", include_in_schema=False)
+async def metrics():
+    import psutil
+    # Update memory usage metric
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    MEMORY_USAGE.set(memory_info.rss)
+    
+    return StreamingResponse(io.BytesIO(generate_latest()), media_type=CONTENT_TYPE_LATEST)
+
 # Error handlers
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc):
@@ -540,7 +591,7 @@ async def global_exception_handler(request, exc):
     logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "Internal server error"}
+        content={"detail": "An unexpected error occurred. Please try again later."}
     )
 
 if __name__ == "__main__":

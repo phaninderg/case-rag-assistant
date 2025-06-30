@@ -1,0 +1,6 @@
+# Linux-specific requirements
+# Include base requirements
+-r requirements.txt
+
+# Quantization packages only available on Linux
+auto-gptq>=0.5.0

@@ -2,13 +2,12 @@ import logging
 from typing import Dict, List, Optional, Any, AsyncGenerator, Union
 import torch
 from langchain.schema import HumanMessage, SystemMessage, AIMessage, BaseMessage
-from langchain.callbacks.manager import CallbackManager
-from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from huggingface_hub import login, HfApi
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from huggingface_hub import login
 import os
 import psutil
 import re
+import gc
 
 from src.config.settings import settings
 
@@ -37,23 +36,40 @@ class LLMService:
         # Configure environment for Apple Silicon
         os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
         
+        # Setup Hugging Face authentication first
+        self._setup_huggingface_auth()
+        
         # Log the model being loaded for debugging
         model_to_load = self.model_path or self.model_name
         
         # Load model using the instance variable which has the correct default from settings
         self.load_model(model_to_load)
-        
-        # Setup Hugging Face authentication
-        self._setup_huggingface_auth()
     
     def _setup_huggingface_auth(self):
         """Set up Hugging Face authentication if API key is provided."""
-        if settings.huggingface_api_key:
-            try:
-                login(token=settings.huggingface_api_key)
-                logger.info("Successfully logged in to Hugging Face Hub")
-            except Exception as e:
-                logger.warning(f"Failed to login to Hugging Face Hub: {str(e)}")
+        if not settings.huggingface_api_key:
+            logger.warning(
+                "HUGGINGFACE_API_KEY is not set. Access to gated models like Gemma will be restricted. "
+                "Please set this environment variable if you need to access gated models."
+            )
+            return
+            
+        if settings.huggingface_api_key == "your_huggingface_api_key_here":
+            logger.warning(
+                "HUGGINGFACE_API_KEY is set to the default placeholder value. "
+                "Please update it with your actual API key in the .env file."
+            )
+            return
+            
+        try:
+            login(token=settings.huggingface_api_key)
+            logger.info("Successfully logged in to Hugging Face Hub")
+        except Exception as e:
+            logger.error(f"Failed to login to Hugging Face Hub: {str(e)}")
+            logger.warning(
+                "Authentication failed. Access to gated models will be restricted. "
+                "Please check your API key and ensure it has the necessary permissions."
+            )
     
     def _get_device(self):
         """Get the appropriate device for model inference."""
@@ -79,9 +95,35 @@ class LLMService:
         """
         if model_identifier is None:
             model_identifier = self.model_path or self.model_name
+        
+        # Check if model is gated and we don't have authentication
+        is_gated_model = "google/gemma" in model_identifier.lower()
+        has_valid_auth = settings.huggingface_api_key and settings.huggingface_api_key != "your_huggingface_api_key_here"
+        
+        # Use fallback model if trying to access gated model without authentication
+        if is_gated_model and not has_valid_auth:
+            fallback_model = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+            logger.warning(f"Model {model_identifier} is gated and requires authentication.")
+            logger.warning(f"Falling back to non-gated model: {fallback_model}")
+            model_identifier = fallback_model
             
         logger.info(f"Loading model: {model_identifier}")
         self._log_memory_usage("Before loading model: ")
+        
+        # Clean up previous model to free memory
+        if self.model is not None:
+            try:
+                del self.model
+                self.model = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                logger.info("Previous model cleaned up successfully")
+            except Exception as e:
+                logger.warning(f"Error cleaning up previous model: {str(e)}")
+        
+        # Define fallback model to use if primary model fails
+        fallback_model = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
         
         try:
             # Get model configuration
@@ -120,14 +162,24 @@ class LLMService:
                 load_in_8bit = False
             
             # Configure tokenizer with proper padding
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_id,  # Use model_id from config
-                padding_side="left",
-                trust_remote_code=True
-            )
-            
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    model_id,  # Use model_id from config
+                    padding_side="left",
+                    trust_remote_code=True
+                )
+                
+                if self.tokenizer.pad_token is None:
+                    self.tokenizer.pad_token = self.tokenizer.eos_token
+            except Exception as e:
+                if model_identifier != fallback_model:
+                    logger.error(f"Error loading tokenizer for {model_id}: {str(e)}")
+                    logger.warning(f"Falling back to {fallback_model}")
+                    return self.load_model(fallback_model)
+                else:
+                    # If even the fallback model fails, re-raise the exception
+                    logger.error(f"Critical error: Fallback model {fallback_model} also failed to load")
+                    raise
             
             # Configure model kwargs with optimizations
             model_kwargs = {
@@ -140,13 +192,19 @@ class LLMService:
             
             # Apply 4-bit or 8-bit quantization if supported
             if load_in_4bit:
-                model_kwargs["load_in_4bit"] = True
-                model_kwargs["bnb_4bit_compute_dtype"] = torch_dtype
-                model_kwargs["bnb_4bit_quant_type"] = "nf4"
-                model_kwargs["bnb_4bit_use_double_quant"] = True
+                from transformers import BitsAndBytesConfig
+                model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch_dtype,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True
+                )
                 logger.info("Using 4-bit quantization")
             elif load_in_8bit:
-                model_kwargs["load_in_8bit"] = True
+                from transformers import BitsAndBytesConfig
+                model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_8bit=True
+                )
                 logger.info("Using 8-bit quantization")
             
             # Special handling for Gemma
@@ -155,29 +213,47 @@ class LLMService:
             
             # Load the model with progress tracking
             logger.info("Loading model, this may take a few minutes...")
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                **model_kwargs
-            )
-            
-            # Set model to eval mode
-            self.model.eval()
-            
-            # Move model to device if not using device_map
-            if device_map is None:
-                self.model = self.model.to("cpu")
-            
-            # Clear CUDA cache if available
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            self._log_memory_usage("After loading model: ")
-            logger.info(f"Model loaded successfully on device: {self.model.device}")
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    **model_kwargs
+                )
+                
+                # Set model to eval mode
+                self.model.eval()
+                
+                # Move model to device if not using device_map
+                if device_map is None:
+                    self.model = self.model.to("cpu")
+                
+                # Clear CUDA cache if available
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                self._log_memory_usage("After loading model: ")
+                logger.info(f"Model loaded successfully on device: {self.model.device}")
+                
+            except Exception as e:
+                if model_identifier != fallback_model:
+                    logger.error(f"Error loading model {model_id}: {str(e)}")
+                    logger.warning(f"Falling back to {fallback_model}")
+                    return self.load_model(fallback_model)
+                else:
+                    # If even the fallback model fails, re-raise the exception
+                    logger.error(f"Critical error: Fallback model {fallback_model} also failed to load")
+                    raise
             
         except Exception as e:
             logger.error(f"Error loading model {model_identifier}: {str(e)}")
             self._log_memory_usage("Error loading model: ")
-            raise
+            
+            # If this is not already the fallback model, try the fallback
+            if model_identifier != fallback_model:
+                logger.warning(f"Attempting to load fallback model {fallback_model}")
+                return self.load_model(fallback_model)
+            else:
+                # If we're already trying to load the fallback model, raise the exception
+                raise
 
     async def generate_response(
         self,
